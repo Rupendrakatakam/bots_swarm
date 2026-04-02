@@ -2,7 +2,7 @@
 
 A robotics path planning and graph theory visualization project featuring **Hybrid A\*** kinematic planning, **Artificial Potential Fields (APF)** for real-time obstacle avoidance, and graph-based node mapping.
 
-<video src="swarm_simulation.mp4" autoplay loop muted playsinline width="100%"></video>
+![Simulation](swarm_simulation.gif)
 
 ## Project Structure
 
@@ -10,7 +10,7 @@ A robotics path planning and graph theory visualization project featuring **Hybr
 .
 ├── apf.py                  # Hybrid A* global planner + APF reactive local planner
 ├── node.py                 # Graph-based node mapping with distance calculations
-├── swarm_simulation.mp4    # Generated simulation output
+├── swarm_simulation.gif    # Generated simulation output
 └── doc.txt                 # Concept notes
 ```
 
@@ -22,7 +22,7 @@ pip install numpy matplotlib networkx
 
 > `networkx` is only required by `node.py`. `apf.py` uses only `numpy`, `matplotlib`, and `heapq` (stdlib).
 >
-> **MP4 export** requires `ffmpeg`: `sudo apt install ffmpeg`
+> **GIF export** requires `Pillow`: `pip install Pillow`
 
 ---
 
@@ -63,7 +63,7 @@ python apf.py
 
 **Animation Export**
 
-The simulation automatically saves as `swarm_simulation.mp4` (500 frames, 30 fps). To export as GIF instead, swap the commented lines in the saving section.
+The simulation automatically saves as `swarm_simulation.gif` (500 frames, 30 fps). To export as MP4 instead, swap the commented lines in the saving section.
 
 **Obstacles:** 4 total — 2 static, 2 moving (sinusoidal horizontal & vertical trajectories).
 

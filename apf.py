@@ -178,12 +178,12 @@ ani = animation.FuncAnimation(fig, animate, frames=500, interval=20, blit=False)
 # ---- SAVING THE ANIMATION ----
 print("4. Saving as GIF... (Please wait, this takes a moment)")
 writer = animation.PillowWriter(fps=30)
-# ani.save("swarm_simulation.gif", writer=writer)
-# print("-> Successfully saved as 'swarm_simulation.gif' in your current directory!")
+ani.save("swarm_simulation.gif", writer=writer)
+print("-> Successfully saved as 'swarm_simulation.gif' in your current directory!")
 
 # If you prefer MP4, comment out the GIF lines above and uncomment the line below:
 # (Note: Requires ffmpeg installed on your system -> sudo apt install ffmpeg)
-ani.save("swarm_simulation.mp4", writer='ffmpeg', fps=30)
-print("-> Successfully saved as 'swarm_simulation.mp4' in your current directory!")
+# ani.save("swarm_simulation.mp4", writer='ffmpeg', fps=30)
+# print("-> Successfully saved as 'swarm_simulation.mp4' in your current directory!")
 
 plt.show()
