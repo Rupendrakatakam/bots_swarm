@@ -1,114 +1,110 @@
-import numpy as np
+import networkx as nx
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
 import math
+import numpy as np
 
-# --- 1. Setup Parameters ---
-start = np.array([10.0, 10.0])      
+# --- 1. Define the Map Parameters ---
+grid_size = 100
+start = (10, 10)
+goal = (95, 95) # Changed slightly from 100 to fit nicely inside the 0-99 grid index
 
-# Instead of just a Goal, we define a sequential list of Waypoints ending at the Goal
-waypoints = np.array([
-    [30.0, 40.0],  # Waypoint 1
-    [70.0, 60.0],  # Waypoint 2
-    [100.0, 100.0] # Final Goal
-])
+obstacles = [
+    (20, 80),  
+    (50, 50),  
+    (80, 20),  
+    (85, 85)   
+]
+safety_radius = 12.0 # How far the robot must stay away from the obstacle center
 
-obstacles = np.array([
-    [20.0, 80.0],  
-    [50.0, 50.0],  
-    [80.0, 20.0],  
-    [90.0, 90.0]   
-])
+# --- 2. Create the Free Space Graph ---
+print("Building 100x100 Grid Graph...")
+# This creates a grid of 10,000 nodes, connected to their Up/Down/Left/Right neighbors
+G = nx.grid_2d_graph(grid_size, grid_size)
 
-k_att = 1.0       
-k_rep = 50000.0   
-rho_0 = 20.0      
-step_size = 0.5   
-wp_threshold = 2.0 # How close the robot must get to a waypoint to "collect" it
+# Add diagonal connections (optional, but makes path smoother)
+# Connects (x, y) to (x+1, y+1), (x-1, y+1), etc.
+edges_to_add = []
+for x, y in G.nodes():
+    if (x+1, y+1) in G.nodes(): edges_to_add.append(((x,y), (x+1, y+1)))
+    if (x-1, y+1) in G.nodes(): edges_to_add.append(((x,y), (x-1, y+1)))
+G.add_edges_from(edges_to_add)
 
-# --- 2. Calculate the Full Path First ---
-current_pos = np.copy(start)
-path = [np.copy(current_pos)]
-current_wp_idx = 0 
-
-for _ in range(2000): # Increased iterations since the path is longer
-    
-    # 1. Get the current target waypoint
-    target = waypoints[current_wp_idx]
-    
-    # 2. Check if we reached the current waypoint
-    if math.dist(current_pos, target) < wp_threshold:
-        if current_wp_idx < len(waypoints) - 1:
-            current_wp_idx += 1  # Move to the next waypoint
-            target = waypoints[current_wp_idx]
-        else:
-            path.append(np.copy(target)) # Reached the Final Goal!
-            break
-            
-    # 3. Calculate Forces (Attracted to the TARGET, not the final goal)
-    F_att = k_att * (target - current_pos)
-    
-    F_rep = np.array([0.0, 0.0])
+# --- 3. Carve out Obstacles ---
+print("Removing nodes inside obstacles...")
+nodes_to_remove = []
+for node in G.nodes():
     for obs in obstacles:
-        d = math.dist(current_pos, obs)
-        if d < rho_0 and d > 0:
-            direction = (current_pos - obs) / d 
-            magnitude = k_rep * (1.0/d - 1.0/rho_0) * (1.0 / (d**2))
-            F_rep += direction * magnitude
-            
-    F_total = F_att + F_rep
-    
-    # 4. Move the Robot
-    force_magnitude = np.linalg.norm(F_total)
-    if force_magnitude > 0:
-        step_vector = (F_total / force_magnitude) * step_size
-    else:
-        step_vector = np.array([0.0, 0.0])
-        
-    current_pos += step_vector
-    path.append(np.copy(current_pos))
+        # If a grid node is inside the safety radius, mark it for deletion
+        if math.dist(node, obs) < safety_radius:
+            nodes_to_remove.append(node)
+            break # No need to check other obstacles
 
-path = np.array(path) 
+G.remove_nodes_from(nodes_to_remove)
 
-# --- 3. Animation Setup ---
-fig, ax = plt.subplots(figsize=(8, 8))
+# --- 4. Run A* Search Algorithm ---
+print("Running A* Search...")
+# A* requires a "heuristic" (an educated guess of distance to the goal)
+# We use our standard Euclidean distance formula
+def euclidean_heuristic(node1, node2):
+    return math.dist(node1, node2)
 
-# Draw Obstacles
-ax.scatter(obstacles[:, 0], obstacles[:, 1], c='red', s=300, marker='X', label='Obstacles')
+try:
+    # nx.astar_path calculates the shortest safe route automatically!
+    full_path = nx.astar_path(G, source=start, target=goal, heuristic=euclidean_heuristic)
+    print(f"Path found! Length: {len(full_path)} steps.")
+except nx.NetworkXNoPath:
+    print("Error: No safe path exists between Start and Goal.")
+    full_path = []
+
+# --- 5. Extract Waypoints ---
+# The full path has hundreds of tiny steps. 
+# We only need a few waypoints to feed to our Local Planner (APF).
+# Let's take every 15th node on the path.
+if full_path:
+    waypoints = full_path[::15]
+    if full_path[-1] not in waypoints:
+        waypoints.append(full_path[-1]) # Ensure goal is the final waypoint
+    waypoints = np.array(waypoints)
+else:
+    waypoints = np.array([])
+
+# --- 6. Visualization ---
+plt.figure(figsize=(8, 8))
+
+# Plot the Free Space (Optional: plotting 10,000 nodes is slow, so we skip drawing the full graph)
+# Instead, we just plot the results
+
+# Plot Obstacles
+obs_arr = np.array(obstacles)
+plt.scatter(obs_arr[:, 0], obs_arr[:, 1], c='red', s=100, marker='X', label='Obstacles')
 for obs in obstacles:
-    circle = plt.Circle((obs[0], obs[1]), rho_0, color='r', fill=False, linestyle='--', alpha=0.5)
-    ax.add_patch(circle)
+    circle = plt.Circle((obs[0], obs[1]), safety_radius, color='r', fill=True, alpha=0.3)
+    plt.gca().add_patch(circle)
 
-# Draw Start, Waypoints, and Goal
-ax.scatter(start[0], start[1], c='green', s=150, label='Start')
-ax.scatter(waypoints[:-1, 0], waypoints[:-1, 1], c='orange', s=100, marker='s', label='Waypoints')
-ax.scatter(waypoints[-1, 0], waypoints[-1, 1], c='gold', s=200, marker='*', label='Final Goal')
+# Plot the Full A* Path
+if full_path:
+    path_arr = np.array(full_path)
+    plt.plot(path_arr[:, 0], path_arr[:, 1], 'k-', alpha=0.3, linewidth=3, label='A* Full Path')
 
-# Draw the "Global Plan" (straight lines between waypoints)
-plan_x = [start[0]] + list(waypoints[:, 0])
-plan_y = [start[1]] + list(waypoints[:, 1])
-ax.plot(plan_x, plan_y, 'k--', alpha=0.3, label='Global Plan')
+# Plot the Extracted Waypoints
+if len(waypoints) > 0:
+    plt.plot(waypoints[:, 0], waypoints[:, 1], 'o--', color='orange', markersize=8, label='Extracted Waypoints')
 
-# Map boundaries and styling
-ax.set_xlim(0, 100)
-ax.set_ylim(0, 100)
-ax.grid(True, linestyle=':', alpha=0.7)
-ax.set_title("APF Navigation using Waypoints")
-ax.legend(loc='lower right')
+# Plot Start and Goal
+plt.scatter(start[0], start[1], c='green', s=150, zorder=5, label='Start')
+plt.scatter(goal[0], goal[1], c='gold', s=200, marker='*', zorder=5, label='Goal')
 
-trail, = ax.plot([], [], 'b-', linewidth=2, alpha=0.5, label='Actual Path')
-robot, = ax.plot([], [], 'bo', markersize=8)
+# Map Styling
+plt.xlim(0, grid_size - 1)
+plt.ylim(0, grid_size - 1)
+plt.grid(True, linestyle=':', alpha=0.5)
+plt.title("A* Global Planner: Automatic Waypoint Generation")
+plt.xlabel("X Coordinate")
+plt.ylabel("Y Coordinate")
+plt.legend(loc='lower right')
 
-# --- 4. Animation Execution ---
-def init():
-    trail.set_data([], [])
-    robot.set_data([], [])
-    return trail, robot
-
-def animate(frame):
-    trail.set_data(path[:frame, 0], path[:frame, 1])
-    robot.set_data([path[frame, 0]], [path[frame, 1]]) 
-    return trail, robot
-
-ani = animation.FuncAnimation(fig, animate, init_func=init, frames=len(path), interval=20, blit=True)
 plt.show()
+
+print("\nGenerated Waypoints for APF:")
+for i, wp in enumerate(waypoints):
+    print(f"Waypoint {i+1}: ({wp[0]}, {wp[1]})")
