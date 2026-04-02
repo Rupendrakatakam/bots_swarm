@@ -1,0 +1,5 @@
+node graph theory
+
+APF - artificial potential field
+
+from ref to node distance
