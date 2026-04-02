@@ -1,62 +1,66 @@
 #5 nodes a map of 100x100 left bottom edge is (0,0) - refernce point and right top edge is (100,100),  from the refence point where are the nodes and with rspect to each other nodes are located in the map using graph theory  
 
+import networkx as nx
 import matplotlib.pyplot as plt
-import numpy as np 
 import math
 
-
-# nodes are at (10,10), (20,20), (30,30), (40,40), (50,50)
-nodes = {
-    'Ref': (0,0),
-    'A': (10,10),
-    'B': (20,20),
-    'C': (30,30),
-    'D': (40,40),
-    'E': (50,50)
+# 1. Define nodes and their coordinates
+node_coords = {
+    'A': (10, 10),
+    'B': (20, 80),
+    'C': (50, 50),
+    'D': (80, 20),
+    'E': (90, 90)
 }
 
-# 1. Calculate Distances from Reference Point (0,0)
-print("--- Distances from Reference Point (0,0) ---")
-for name, coords in nodes.items():
-    if name != 'Ref':
-        # math.dist calculates the Euclidean distance between two points
-        dist = math.dist(nodes['Ref'], coords)
-        print(f"To Node {name}: {dist:.2f} units")
+# 2. Initialize an empty Graph
+G = nx.Graph()
 
-print("\n--- Distance Matrix (Node to Node) ---")
-# 2. Calculate Pairwise Distances between nodes
-node_names = ['A', 'B', 'C', 'D', 'E']
+# 3. Add nodes to the graph along with their (x, y) positions
+for node, pos in node_coords.items():
+    G.add_node(node, pos=pos)
 
-# Print a simple header for our table
-print(f"{'':>4} | " + " | ".join([f"{n:>5}" for n in node_names]))
-print("-" * 45)
+# 4. Connect nodes based on a distance rule
+# Let's say we only connect nodes that are less than 60 units apart
+threshold = 60.0
+node_names = list(node_coords.keys())
 
-# Calculate and print the distance from every node to every other node
-for n1 in node_names:
-    row_data = [f"{n1:>4} |"]
-    for n2 in node_names:
-        # Distance from node n1 to node n2
-        dist = math.dist(nodes[n1], nodes[n2])
-        row_data.append(f"{dist:>5.1f}")
-    
-    print(" | ".join(row_data))
+# Loop through every unique pair of nodes
+for i in range(len(node_names)):
+    for j in range(i + 1, len(node_names)):
+        n1 = node_names[i]
+        n2 = node_names[j]
+        
+        # Calculate Euclidean distance
+        dist = math.dist(node_coords[n1], node_coords[n2])
+        
+        # If they are close enough, add an edge!
+        if dist <= threshold:
+            # We save the distance as the edge 'weight'
+            G.add_edge(n1, n2, weight=round(dist, 1))
 
-#visualization
-x_coords = [coord[0] for coord in nodes.values()]
-y_coords = [coord[1] for coord in nodes.values()]
-labels = list(nodes.keys())
-
+# 5. Visualization Setup
 plt.figure(figsize=(8, 8))
-plt.scatter(x_coords, y_coords, color='red', s=100) # Plot nodes
 
-for label, x, y in zip(labels, x_coords, y_coords):
-    plt.text(x + 2, y + 2, label, fontsize=12, fontweight='bold')
+# Extract the positions we saved earlier so NetworkX knows where to draw them
+pos = nx.get_node_attributes(G, 'pos')
 
+# Draw the nodes and the connecting lines (edges)
+nx.draw(G, pos, with_labels=True, node_color='lightgreen', 
+        node_size=1000, font_size=12, font_weight='bold', edge_color='gray')
+
+# Draw the distance numbers on top of the lines
+edge_labels = nx.get_edge_attributes(G, 'weight')
+nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=10)
+
+# Set up the 100x100 map boundaries
 plt.xlim(0, 100)
 plt.ylim(0, 100)
 plt.grid(True, linestyle='--', alpha=0.6)
-plt.title("5-Node Graph Map (100x100)")
-plt.xlabel("X-axis (Distance from Reference)")
-plt.ylabel("Y-axis (Distance from Reference)")
+plt.title(f"Nodes Connected if Distance ≤ {threshold}")
+plt.xlabel("X-axis")
+plt.ylabel("Y-axis")
 
+# NetworkX hides axes by default, so we turn them back on to see the 100x100 grid
+plt.axis('on') 
 plt.show()
