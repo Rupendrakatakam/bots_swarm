@@ -18,7 +18,7 @@ obstacles = np.array([
     [80.0, 20.0],  
     [80.0, 85.0]   
 ])
-safety_radius = 12.0 
+safety_radius = 5.0 
 
 # Hybrid A* Kinematic Parameters
 V = 2.0        
