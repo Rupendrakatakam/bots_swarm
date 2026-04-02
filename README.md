@@ -6,9 +6,10 @@ A robotics path planning and graph theory visualization project featuring **Hybr
 
 ```
 .
-├── apf.py      # Hybrid A* global planner + APF reactive local planner
-├── node.py     # Graph-based node mapping with distance calculations
-└── doc.txt     # Concept notes
+├── apf.py                  # Hybrid A* global planner + APF reactive local planner
+├── node.py                 # Graph-based node mapping with distance calculations
+├── swarm_simulation.mp4    # Generated simulation output
+└── doc.txt                 # Concept notes
 ```
 
 ## Prerequisites
@@ -18,6 +19,14 @@ pip install numpy matplotlib networkx
 ```
 
 > `networkx` is only required by `node.py`. `apf.py` uses only `numpy`, `matplotlib`, and `heapq` (stdlib).
+>
+> **MP4 export** requires `ffmpeg`: `sudo apt install ffmpeg`
+
+---
+
+## Simulation
+
+https://github.com/user-attachments/assets/swarm_simulation.mp4
 
 ---
 
@@ -55,6 +64,10 @@ python apf.py
 | `rho_0` | 15.0 | Repulsive influence radius |
 | `step_size` | 0.5 | Max step per frame |
 | `wp_threshold` | 3.0 | Distance to accept a waypoint |
+
+**Animation Export**
+
+The simulation automatically saves as `swarm_simulation.mp4` (500 frames, 30 fps). To export as GIF instead, swap the commented lines in the saving section.
 
 **Obstacles:** 4 total — 2 static, 2 moving (sinusoidal horizontal & vertical trajectories).
 
