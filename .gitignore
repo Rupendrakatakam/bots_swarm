@@ -1,0 +1,29 @@
+# Virtual environments
+swarm_env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Git submodule pointer (the actual content is tracked separately)
+Python-RVO2/.git
+Python-RVO2/build/
+Python-RVO2/*.egg-info/
+Python-RVO2/__pycache__/
+Python-RVO2/src/rvo2.cpp
