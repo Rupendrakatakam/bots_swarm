@@ -2,6 +2,8 @@
 
 A robotics path planning and graph theory visualization project featuring **Hybrid A\*** kinematic planning, **Artificial Potential Fields (APF)** for real-time obstacle avoidance, and graph-based node mapping.
 
+<video src="swarm_simulation.mp4" autoplay loop muted playsinline width="100%"></video>
+
 ## Project Structure
 
 ```
@@ -21,12 +23,6 @@ pip install numpy matplotlib networkx
 > `networkx` is only required by `node.py`. `apf.py` uses only `numpy`, `matplotlib`, and `heapq` (stdlib).
 >
 > **MP4 export** requires `ffmpeg`: `sudo apt install ffmpeg`
-
----
-
-## Simulation
-
-https://github.com/user-attachments/assets/swarm_simulation.mp4
 
 ---
 
