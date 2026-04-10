@@ -37,7 +37,15 @@ class HybridAStar:
         self.YAW_RESO = math.radians(15) 
         self.dt = 0.5
 
-        self.controls = [(1.0, 0.0), (1.0, 0.5), (1.0, -0.5), (0.0, 1.0), (0.0, -1.0)]
+        # Inside hybrid_astar.py -> HybridAStar.__init__
+        self.controls = [
+            (1.0, 0.0),   # Drive straight
+            (1.0, 0.5),   # Curve left
+            (1.0, -0.5),  # Curve right
+            (0.0, 1.0),   # Spin left
+            (0.0, -1.0),  # Spin right
+            (0.0, 0.0)    # NEW: Wait in place (Brakes)
+        ]
 
     def _get_discrete_state(self, x, y, theta):
         idx_x = int(round(x / self.XY_RESO))
@@ -105,16 +113,29 @@ class HybridAStar:
             if state_key in closed_set: continue
             closed_set.add(state_key)
             
+            # --- Update this section inside find_path() in hybrid_astar.py ---
             for v, w in self.controls:
                 new_x, new_y, new_theta = self._simulate_step(current, v, w)
                 new_time = current.time_step + 1
                 
+                # 1. HARD CAP: Prevent infinite time loops
+                if new_time > 200: 
+                    continue
+
                 if not self._is_valid(new_x, new_y, new_time):
                     continue
                     
                 child = KinematicNode(new_x, new_y, new_theta, time_step=new_time, parent=current, v=v, w=w)
-                turn_penalty = abs(w) * 0.5 
-                child.g = current.g + (v * self.dt) + turn_penalty
+                
+                # 2. COST CALCULATION FIX
+                if v == 0.0 and w == 0.0:
+                    # Heavy penalty for procrastinating (waiting)
+                    step_cost = 2.0  
+                else:
+                    # Normal cost for driving + slight penalty for turning
+                    step_cost = (v * self.dt) + (abs(w) * 0.5)
+
+                child.g = current.g + step_cost
                 child.h = self._heuristic(child.x, child.y)
                 child.f = child.g + child.h
                 
