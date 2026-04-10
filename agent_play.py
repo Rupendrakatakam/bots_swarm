@@ -4,65 +4,24 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.patches import Circle
 
+# Import your custom modules
 from hybrid_astar import HybridAStar
 from apf import APF
+from robot import DiffDriveRobot  # Importing the newly separated robot
 
 # --- Continuous Environment Setup ---
 WORLD_SIZE = 20.0
 OBSTACLE_RADIUS = 1.0
 ROBOT_RADIUS = 1.0
 
-# Define directly in continuous (X, Y, Theta) coordinates
 START = (2.0, 2.0, math.pi/4)  
 GOAL = (18.0, 18.0, 0.0)       
 
 # Obstacles: (x, y, radius)
 OBSTACLES = [
     (10.0, 10.0, OBSTACLE_RADIUS),
-    (14.0, 15.0, OBSTACLE_RADIUS)  # Added a second obstacle for a more interesting path!
+    (14.0, 15.0, OBSTACLE_RADIUS)
 ]
-
-# --- Differential Drive Robot Definition ---
-class DiffDriveRobot:
-    def __init__(self, start_pos, start_theta=0.0):
-        # State
-        self.x = start_pos[0]
-        self.y = start_pos[1]
-        self.theta = start_theta
-        
-        # Dimensions
-        self.radius = ROBOT_RADIUS        
-        self.wheel_dist = 0.5625  
-        self.wheel_width = 0.125  
-        self.wheel_length = 0.8   
-        
-        # Kinematic Limits
-        self.max_v = 1.5          
-        self.max_omega = np.pi    
-        
-    def step(self, force, dt=0.2):
-        fx, fy = force
-        force_mag = np.linalg.norm(force)
-        
-        if force_mag < 0.01:
-            return np.array([self.x, self.y])
-
-        target_theta = np.arctan2(fy, fx)
-        
-        error_theta = target_theta - self.theta
-        error_theta = (error_theta + np.pi) % (2 * np.pi) - np.pi
-        
-        omega = 2.5 * error_theta 
-        omega = np.clip(omega, -self.max_omega, self.max_omega)
-        
-        v = force_mag * np.cos(error_theta)
-        v = np.clip(max(0, v), 0, self.max_v)
-        
-        self.theta += omega * dt
-        self.x += v * np.cos(self.theta) * dt
-        self.y += v * np.sin(self.theta) * dt
-        
-        return np.array([self.x, self.y])
 
 def run_simulation():
     print("=== Continuous Hybrid Navigation ===")
@@ -83,14 +42,16 @@ def run_simulation():
     global_path, controls = result
     print(f"   -> Path found with {len(global_path)} kinematic states.")
 
-    # 2. LOCAL PLANNER (APF)
+    # 2. LOCAL PLANNER (APF & Robot)
     print("2. Running APF Local Planner tracking Hybrid A* waypoints...")
+    
+    # Initialize our separated robot
     robot = DiffDriveRobot(start_pos=(START[0], START[1]), start_theta=START[2])
 
     apf = APF(
-        k_att=2.0,   # slightly stronger pull to keep it on the continuous track
+        k_att=1.5,   
         k_rep=15.0, 
-        rho_0=OBSTACLE_RADIUS + ROBOT_RADIUS + 0, 
+        rho_0=OBSTACLE_RADIUS + 1.0 + 0.5, 
         obstacles=OBSTACLES
     )
 
@@ -103,24 +64,20 @@ def run_simulation():
     for step in range(max_steps):
         agent_pos = np.array([robot.x, robot.y])
         
-        # Check if reached final goal
         if np.linalg.norm(agent_pos - final_goal) < 0.5:
             history.append((robot.x, robot.y, robot.theta))
             print("Goal Reached!")
             break
 
-        # Get target from Hybrid A* path (ignoring the theta, APF just needs X/Y)
         target_x, target_y, _ = global_path[waypoint_index]
         current_waypoint = np.array([target_x, target_y])
         
-        # Advance waypoint if the robot gets close to it
         if np.linalg.norm(agent_pos - current_waypoint) < 1.0:
             if waypoint_index < len(global_path) - 1:
                 waypoint_index += 1
                 target_x, target_y, _ = global_path[waypoint_index]
                 current_waypoint = np.array([target_x, target_y])
 
-        # Get Force and move robot
         force = apf.get_force(agent_pos, current_waypoint)
         robot.step(force, dt=0.2)
         history.append((robot.x, robot.y, robot.theta))
@@ -131,13 +88,14 @@ if __name__ == '__main__':
     global_path, history, robot_def = run_simulation()
 
     if global_path is not None and history is not None:
-        fig, ax = plt.subplots(figsize=(10, 10))
+        # --- Visualization & Animation ---
+        inches = WORLD_SIZE / 2.54 
+        fig, ax = plt.subplots(figsize=(inches, inches), dpi=100)
 
-        # --- 1. Plot Static Elements ---
-        # Extract X and Y from the Hybrid A* (x, y, theta) tuples
+        # Static Elements
         gx = [p[0] for p in global_path]
         gy = [p[1] for p in global_path]
-        ax.plot(gx, gy, 'r--', linewidth=1.0, alpha=0.6, label='Global Path (Hybrid A*)')
+        ax.plot(gx, gy, 'r--', linewidth=2.0, alpha=0.6, label='Global Path (Hybrid A*)')
 
         ax.scatter(START[0], START[1], s=200, c='green', marker='s', label='Start')
         ax.scatter(GOAL[0], GOAL[1], s=300, c='magenta', marker='*', label='Goal')
@@ -146,9 +104,9 @@ if __name__ == '__main__':
             obs_x, obs_y, radius = obs
             ax.scatter(obs_x, obs_y, s=100, c='black')
             ax.add_patch(plt.Circle((obs_x, obs_y), radius, fill=True, color='red', alpha=0.3))
-            ax.add_patch(plt.Circle((obs_x, obs_y), radius + robot_def.radius + 1.5, fill=False, color='orange', linestyle='--'))
+            ax.add_patch(plt.Circle((obs_x, obs_y), radius + robot_def.radius + 0.5, fill=False, color='orange', linestyle='--'))
 
-        # --- 2. Dynamic Robot Patches ---
+        # Dynamic Elements
         body_patch = Circle((history[0][0], history[0][1]), robot_def.radius, fill=True, color='blue', alpha=0.5, label='Diff-Drive Robot')
         ax.add_patch(body_patch)
         
@@ -160,7 +118,7 @@ if __name__ == '__main__':
         # Formatting
         ax.set_xlim(0, WORLD_SIZE)
         ax.set_ylim(0, WORLD_SIZE)
-        ax.set_aspect('equal') # No longer need to invert Y axis since we aren't using arrays!
+        ax.set_aspect('equal')
         ax.set_title('Advanced Hybrid Navigation: Hybrid A* + APF', fontsize=16)
         ax.grid(True, linestyle=':', color='gray', alpha=0.6)
         
@@ -168,7 +126,14 @@ if __name__ == '__main__':
         by_label = dict(zip(labels, handles))
         ax.legend(by_label.values(), by_label.keys(), loc='upper left', bbox_to_anchor=(1.05, 1))
 
-        # --- 3. Animation Update ---
+        ticks = np.arange(0, WORLD_SIZE + 1, 1)
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
+        
+        # Turn on the grid with solid lines to create clear squares
+        ax.grid(True, which='major', linestyle='-', color='black', alpha=0.4, linewidth=1)
+
+        # Animation Loop
         def update(frame):
             x, y, theta = history[frame]
             
