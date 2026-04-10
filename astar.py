@@ -1,4 +1,6 @@
 import heapq
+import numpy as np
+
 
 class Node:
     def __init__(self, position, parent=None):
@@ -13,25 +15,50 @@ class Node:
 
 
 class AStar:
-    def __init__(self, grid, start, goal):
+    def __init__(self, start, goal, world_size=20, cell_size=1, obstacles=None):
         """
         Initializes the A* pathfinding algorithm.
         
-        :param grid: 2D list or numpy array where 0 is free space and non-zero is an obstacle.
         :param start: Tuple (row, col) representing the starting position.
         :param goal: Tuple (row, col) representing the goal position.
+        :param world_size: Size of the grid (world_size x world_size).
+        :param cell_size: Size of each cell in cm.
+        :param obstacles: List of tuples (row, col, radius) for circular obstacles.
         """
-        self.grid = grid
+        self.world_size = world_size
+        self.cell_size = cell_size
         self.start = start
         self.goal = goal
-        self.rows = len(grid)
-        self.cols = len(grid[0])
-        # 4-way movement (Right, Left, Down, Up)
-        self.neighbors = [(0, 1), (0, -1), (1, 0), (-1, 0)]
+        self.rows = world_size
+        self.cols = world_size
+        self.neighbors = [(0, 1), (0, -1), (1, 0), (-1, 0) ,(1,1), (1,-1), (-1,1), (-1,-1)]
+
+        self.grid = self._create_grid(obstacles)
+
+    def _create_grid(self, obstacles):
+        grid = np.zeros((self.rows, self.cols))
+
+        if obstacles is None:
+            return grid
+
+        for obs_row, obs_col, radius in obstacles:
+            obs_x = obs_col * self.cell_size
+            obs_y = obs_row * self.cell_size
+            influence = radius + self.cell_size
+
+            for row in range(self.rows):
+                for col in range(self.cols):
+                    wx = col * self.cell_size
+                    wy = row * self.cell_size
+                    dist = np.sqrt((wx - obs_x)**2 + (wy - obs_y)**2)
+                    if dist < influence:
+                        grid[row, col] = 1
+
+        return grid
 
     def _heuristic(self, a, b):
-        # Manhattan distance
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+        # Euclidean distance
+        return np.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
 
     def find_path(self):
         """
@@ -84,7 +111,9 @@ class AStar:
 
                 # Create child node
                 child = Node(node_pos, current_node)
-                child.g = current_node.g + 1
+                # If the move is diagonal (both row and col change), cost is 1.414. Otherwise, 1.
+                cost = 1.414 if new_position[0] != 0 and new_position[1] != 0 else 1
+                child.g = current_node.g + cost
                 child.h = self._heuristic(child.position, goal_node.position)
                 child.f = child.g + child.h
 
