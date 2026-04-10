@@ -1,170 +1,198 @@
 import numpy as np
+import math
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from astar import AStar
+from matplotlib.patches import Circle
+
+from hybrid_astar import HybridAStar
 from apf import APF
 
-# --- Environment Setup ---
-WORLD_SIZE = 20
-CELL_SIZE = 1
-AGENT_DIAMETER = 1
-AGENT_RADIUS = AGENT_DIAMETER / 2
-OBSTACLE_RADIUS = 2
+# --- Continuous Environment Setup ---
+WORLD_SIZE = 20.0
+OBSTACLE_RADIUS = 1.0
+ROBOT_RADIUS = 1.0
 
-START = (1, 1)    # (row, col)
-GOAL = (19, 19)   # (row, col)
+# Define directly in continuous (X, Y, Theta) coordinates
+START = (2.0, 2.0, math.pi/4)  
+GOAL = (18.0, 18.0, 0.0)       
 
-# Obstacles: (row, col, radius)
+# Obstacles: (x, y, radius)
 OBSTACLES = [
-    (10, 10, OBSTACLE_RADIUS)
+    (10.0, 10.0, OBSTACLE_RADIUS),
+    (14.0, 15.0, OBSTACLE_RADIUS)  # Added a second obstacle for a more interesting path!
 ]
 
-def grid_to_world(row_col):
-    """Converts matrix indices (row, col) to geometric (x, y)."""
-    row, col = row_col
-    return (col * CELL_SIZE, row * CELL_SIZE)
+# --- Differential Drive Robot Definition ---
+class DiffDriveRobot:
+    def __init__(self, start_pos, start_theta=0.0):
+        # State
+        self.x = start_pos[0]
+        self.y = start_pos[1]
+        self.theta = start_theta
+        
+        # Dimensions
+        self.radius = ROBOT_RADIUS        
+        self.wheel_dist = 0.5625  
+        self.wheel_width = 0.125  
+        self.wheel_length = 0.8   
+        
+        # Kinematic Limits
+        self.max_v = 1.5          
+        self.max_omega = np.pi    
+        
+    def step(self, force, dt=0.2):
+        fx, fy = force
+        force_mag = np.linalg.norm(force)
+        
+        if force_mag < 0.01:
+            return np.array([self.x, self.y])
+
+        target_theta = np.arctan2(fy, fx)
+        
+        error_theta = target_theta - self.theta
+        error_theta = (error_theta + np.pi) % (2 * np.pi) - np.pi
+        
+        omega = 2.5 * error_theta 
+        omega = np.clip(omega, -self.max_omega, self.max_omega)
+        
+        v = force_mag * np.cos(error_theta)
+        v = np.clip(max(0, v), 0, self.max_v)
+        
+        self.theta += omega * dt
+        self.x += v * np.cos(self.theta) * dt
+        self.y += v * np.sin(self.theta) * dt
+        
+        return np.array([self.x, self.y])
 
 def run_simulation():
-    print("=== Hybrid Navigation ===")
+    print("=== Continuous Hybrid Navigation ===")
     
-    # 1. GLOBAL PLANNER (A*)
-    print("1. Running Global Planner (A*)...")
-    astar = AStar(
-        start=START,
-        goal=GOAL,
-        world_size=WORLD_SIZE,
-        cell_size=CELL_SIZE,
-        obstacles=OBSTACLES
+    # 1. GLOBAL PLANNER (Hybrid A*)
+    print("1. Calculating continuous kinematic path (Hybrid A*)...")
+    h_astar = HybridAStar(
+        start_pose=START, 
+        goal_pose=GOAL, 
+        obstacles=OBSTACLES,
+        robot_radius=1.0
     )
     
-    global_path_grid = astar.find_path()
-    if not global_path_grid:
-        print("ERROR: A* could not find a path!")
+    result = h_astar.find_path()
+    if result is None:
         return None, None, None
+        
+    global_path, controls = result
+    print(f"   -> Path found with {len(global_path)} kinematic states.")
 
-    global_path = [grid_to_world(p) for p in global_path_grid]
-    
     # 2. LOCAL PLANNER (APF)
-    print("2. Running Local Planner (APF)...")
-    
-    apf_obstacles = []
-    for obs in OBSTACLES:
-        apf_obstacles.append(grid_to_world((obs[0], obs[1])))
+    print("2. Running APF Local Planner tracking Hybrid A* waypoints...")
+    robot = DiffDriveRobot(start_pos=(START[0], START[1]), start_theta=START[2])
 
     apf = APF(
-        k_att=0.5, 
-        k_rep=10.0, 
-        rho_0=OBSTACLE_RADIUS + AGENT_RADIUS + 1, 
-        obstacles=apf_obstacles
+        k_att=2.0,   # slightly stronger pull to keep it on the continuous track
+        k_rep=15.0, 
+        rho_0=OBSTACLE_RADIUS + ROBOT_RADIUS + 0, 
+        obstacles=OBSTACLES
     )
 
-    agent_pos = np.array(grid_to_world(START), dtype=float)
-    final_goal = np.array(grid_to_world(GOAL), dtype=float)
+    final_goal = np.array([GOAL[0], GOAL[1]], dtype=float)
+    history = [(robot.x, robot.y, robot.theta)]
     
-    local_path = [agent_pos.copy()]
     waypoint_index = 1 
-    
-    max_steps = 1000
-    step_size = 0.5
+    max_steps = 1500
 
     for step in range(max_steps):
-        if np.linalg.norm(agent_pos - final_goal) < step_size:
-            local_path.append(final_goal)
+        agent_pos = np.array([robot.x, robot.y])
+        
+        # Check if reached final goal
+        if np.linalg.norm(agent_pos - final_goal) < 0.5:
+            history.append((robot.x, robot.y, robot.theta))
             print("Goal Reached!")
             break
 
-        current_waypoint = np.array(global_path[waypoint_index])
+        # Get target from Hybrid A* path (ignoring the theta, APF just needs X/Y)
+        target_x, target_y, _ = global_path[waypoint_index]
+        current_waypoint = np.array([target_x, target_y])
         
-        if np.linalg.norm(agent_pos - current_waypoint) < 1.5:
+        # Advance waypoint if the robot gets close to it
+        if np.linalg.norm(agent_pos - current_waypoint) < 1.0:
             if waypoint_index < len(global_path) - 1:
                 waypoint_index += 1
-                current_waypoint = np.array(global_path[waypoint_index])
+                target_x, target_y, _ = global_path[waypoint_index]
+                current_waypoint = np.array([target_x, target_y])
 
+        # Get Force and move robot
         force = apf.get_force(agent_pos, current_waypoint)
-        
-        force_magnitude = np.linalg.norm(force)
-        if force_magnitude > 0:
-            force = (force / force_magnitude) * step_size
+        robot.step(force, dt=0.2)
+        history.append((robot.x, robot.y, robot.theta))
 
-        agent_pos += force
-        local_path.append(agent_pos.copy())
-
-    return astar.grid, global_path, np.array(local_path)
+    return global_path, history, robot
 
 if __name__ == '__main__':
-    grid, global_path, local_path = run_simulation()
+    global_path, history, robot_def = run_simulation()
 
-    if global_path is not None and local_path is not None:
-        # --- Animation Setup ---
+    if global_path is not None and history is not None:
         fig, ax = plt.subplots(figsize=(10, 10))
 
-        # 1. Plot Static Elements (Background, A* path, Start/Goal)
-        gx, gy = zip(*global_path)
-        ax.plot(gx, gy, 'r--', linewidth=2.5, alpha=0.5, label='Global Path (A*)')
+        # --- 1. Plot Static Elements ---
+        # Extract X and Y from the Hybrid A* (x, y, theta) tuples
+        gx = [p[0] for p in global_path]
+        gy = [p[1] for p in global_path]
+        ax.plot(gx, gy, 'r--', linewidth=1.0, alpha=0.6, label='Global Path (Hybrid A*)')
 
-        start_world = grid_to_world(START)
-        goal_world = grid_to_world(GOAL)
-        ax.scatter(start_world[0], start_world[1], s=200, c='green', marker='s', label='Start')
-        ax.scatter(goal_world[0], goal_world[1], s=300, c='magenta', marker='*', label='Goal')
+        ax.scatter(START[0], START[1], s=200, c='green', marker='s', label='Start')
+        ax.scatter(GOAL[0], GOAL[1], s=300, c='magenta', marker='*', label='Goal')
 
-        # Draw Obstacles
         for obs in OBSTACLES:
-            obs_x, obs_y = grid_to_world((obs[0], obs[1]))
-            radius = obs[2]
-            
+            obs_x, obs_y, radius = obs
             ax.scatter(obs_x, obs_y, s=100, c='black')
-            circ = plt.Circle((obs_x, obs_y), radius, fill=True, color='red', alpha=0.3)
-            ax.add_patch(circ)
-            
-            rho_0 = radius + AGENT_RADIUS + 2
-            circ_inf = plt.Circle((obs_x, obs_y), rho_0, fill=False, color='orange', linestyle='--')
-            ax.add_patch(circ_inf)
+            ax.add_patch(plt.Circle((obs_x, obs_y), radius, fill=True, color='red', alpha=0.3))
+            ax.add_patch(plt.Circle((obs_x, obs_y), radius + robot_def.radius + 1.5, fill=False, color='orange', linestyle='--'))
 
-        # 2. Initialize Dynamic Elements (Agent and APF Trail)
-        # The agent is drawn as a circle matching its physical diameter
-        agent_patch = plt.Circle((start_world[0], start_world[1]), AGENT_RADIUS, fill=True, color='blue', alpha=0.7, label='Agent')
-        ax.add_patch(agent_patch)
+        # --- 2. Dynamic Robot Patches ---
+        body_patch = Circle((history[0][0], history[0][1]), robot_def.radius, fill=True, color='blue', alpha=0.5, label='Diff-Drive Robot')
+        ax.add_patch(body_patch)
         
-        # The trail the agent leaves behind
-        trail_line, = ax.plot([], [], 'b-', linewidth=2.5, label='Actual Path (APF)')
+        heading_line, = ax.plot([], [], 'k-', linewidth=2)
+        left_wheel, = ax.plot([], [], 'k-', linewidth=4)
+        right_wheel, = ax.plot([], [], 'k-', linewidth=4)
+        trail_line, = ax.plot([], [], 'b-', linewidth=1.5, alpha=0.7, label='Actual Driven Path')
 
         # Formatting
         ax.set_xlim(0, WORLD_SIZE)
         ax.set_ylim(0, WORLD_SIZE)
-        ax.invert_yaxis()
-        ax.set_aspect('equal')
-        ax.set_title('Hybrid Planner Animation', fontsize=16, pad=20)
+        ax.set_aspect('equal') # No longer need to invert Y axis since we aren't using arrays!
+        ax.set_title('Advanced Hybrid Navigation: Hybrid A* + APF', fontsize=16)
+        ax.grid(True, linestyle=':', color='gray', alpha=0.6)
         
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
-        ax.legend(by_label.values(), by_label.keys(), loc='center left', bbox_to_anchor=(1.05, 0.5))
-        
-        ax.set_xticks(np.arange(0, WORLD_SIZE + 1, CELL_SIZE))
-        ax.set_yticks(np.arange(0, WORLD_SIZE + 1, CELL_SIZE))
-        ax.grid(True, linestyle=':', color='gray', alpha=0.6)
+        ax.legend(by_label.values(), by_label.keys(), loc='upper left', bbox_to_anchor=(1.05, 1))
 
-        # 3. Animation Update Function
+        # --- 3. Animation Update ---
         def update(frame):
-            # Update the trail up to the current frame
-            trail_x = local_path[:frame+1, 0]
-            trail_y = local_path[:frame+1, 1]
-            trail_line.set_data(trail_x, trail_y)
+            x, y, theta = history[frame]
             
-            # Update the agent's current position
-            current_pos = local_path[frame]
-            agent_patch.center = (current_pos[0], current_pos[1])
+            hx = [p[0] for p in history[:frame+1]]
+            hy = [p[1] for p in history[:frame+1]]
+            trail_line.set_data(hx, hy)
             
-            return trail_line, agent_patch
+            body_patch.center = (x, y)
+            heading_line.set_data([x, x + robot_def.radius * np.cos(theta)], 
+                                  [y, y + robot_def.radius * np.sin(theta)])
+            
+            lx = x - robot_def.wheel_dist * np.sin(theta)
+            ly = y + robot_def.wheel_dist * np.cos(theta)
+            rx = x + robot_def.wheel_dist * np.sin(theta)
+            ry = y - robot_def.wheel_dist * np.cos(theta)
+            
+            wl = robot_def.wheel_length / 2.0
+            left_wheel.set_data([lx - wl * np.cos(theta), lx + wl * np.cos(theta)],
+                                [ly - wl * np.sin(theta), ly + wl * np.sin(theta)])
+            right_wheel.set_data([rx - wl * np.cos(theta), rx + wl * np.cos(theta)],
+                                 [ry - wl * np.sin(theta), ry + wl * np.sin(theta)])
+            
+            return trail_line, body_patch, heading_line, left_wheel, right_wheel
 
-        # 4. Run Animation
-        ani = animation.FuncAnimation(
-            fig, 
-            update, 
-            frames=len(local_path), 
-            interval=30,     # Milliseconds between frames (adjust for speed)
-            repeat=False,    # Stops when it reaches the goal
-            blit=False       # Set to False because we are updating complex patches
-        )
-
+        ani = animation.FuncAnimation(fig, update, frames=len(history), interval=15, repeat=False)
         plt.tight_layout()
         plt.show()
