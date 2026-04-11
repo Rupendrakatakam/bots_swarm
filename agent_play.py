@@ -12,15 +12,15 @@ from robot import DiffDriveRobot
 # --- Environment Setup ---
 WORLD_SIZE = 20.0
 
-CIRC_OBSTACLES = [(14.0, 15.0, 2.0)]
+CIRC_OBSTACLES = [(14.0, 15.0, 1.0)]
 RECT_OBSTACLES = []
 
 # Define Multi-Agent Data
 AGENTS_DATA = {
     'A': {'start': (2.0, 2.0, math.pi/4), 'goal': (18.0, 18.0, 0.0), 'color': 'blue'},
-    'B': {'start': (2.0, 7.0, 3*math.pi/4), 'goal': (18.0, 2.0, math.pi), 'color': 'green'},
-    'C': {'start': (7.0, 3.0, 3*math.pi/4), 'goal': (2.0, 18.0, math.pi), 'color': 'red'},
-    'D': {'start': (7.0, 7.0, 3*math.pi/4), 'goal': (2.0, 2.0, math.pi), 'color': 'yellow'},
+    # 'B': {'start': (2.0, 7.0, 3*math.pi/4), 'goal': (18.0, 2.0, math.pi), 'color': 'green'},
+    # 'C': {'start': (7.0, 3.0, 3*math.pi/4), 'goal': (2.0, 18.0, math.pi), 'color': 'red'},
+    # 'D': {'start': (7.0, 7.0, 3*math.pi/4), 'goal': (2.0, 2.0, math.pi), 'color': 'yellow'},
 }
 
 def run_simulation():
@@ -53,7 +53,7 @@ def run_simulation():
         robots[a_id].wheel_length = 0.8
         
         # Each agent has its own APF
-        apfs[a_id] = APF(k_att=1.5, k_rep=15.0, rho_0=2.5, obstacles=CIRC_OBSTACLES, rect_obstacles=RECT_OBSTACLES)
+        apfs[a_id] = APF(k_att=1.0, k_rep=15.0, rho_0=2.5, obstacles=CIRC_OBSTACLES, rect_obstacles=RECT_OBSTACLES)
         histories[a_id].append((robots[a_id].x, robots[a_id].y, robots[a_id].theta))
 
     max_steps = 1500
@@ -76,14 +76,32 @@ def run_simulation():
             else:
                 all_reached = False
 
-            # Waypoint tracking
+            # --- START OF WAYPOINT TRACKING ---
             path = global_paths[a_id]
-            idx = waypoint_indices[a_id]
-            target_x, target_y, _ = path[idx] if idx < len(path) else path[-1]
-            current_waypoint = np.array([target_x, target_y])
+            current_idx = waypoint_indices[a_id]
             
-            if np.linalg.norm(agent_pos - current_waypoint) < 1.0 and idx < len(path) - 1:
-                waypoint_indices[a_id] += 1
+            # 1. Find the closest waypoint currently ahead of the robot
+            # We scan the next 15 points to see which one we are actually closest to
+            min_dist = float('inf')
+            best_idx = current_idx
+            search_range = min(current_idx + 15, len(path))
+            
+            for i in range(current_idx, search_range):
+                dist = np.linalg.norm(agent_pos - np.array([path[i][0], path[i][1]]))
+                if dist < min_dist:
+                    min_dist = dist
+                    best_idx = i
+                    
+            # Update our official index to this closest point
+            waypoint_indices[a_id] = best_idx
+            
+            # 2. Place the "Carrot" a few steps ahead of the closest point
+            # Lowered from +5 to +3 so it tracks corners a bit tighter
+            lookahead_idx = min(best_idx + 3, len(path) - 1)
+            target_x, target_y, _ = path[lookahead_idx]
+            current_waypoint = np.array([target_x, target_y])
+            # --- END OF WAYPOINT TRACKING ---
+
 
             # --- DYNAMIC APF INJECTION ---
             dynamic_obstacles = CIRC_OBSTACLES.copy()
@@ -132,8 +150,37 @@ if __name__ == '__main__':
         fig, ax = plt.subplots(figsize=(10, 10))
 
         # Draw Environments
+# Draw Environments and Inflation Boundaries
+        INFLATION_BUFFER = 1.5  
+
+        # 1. Circular Obstacles
         for obs in CIRC_OBSTACLES:
-            ax.add_patch(Circle((obs[0], obs[1]), obs[2], fill=True, color='red', alpha=0.3))
+            cx, cy, radius = obs
+            # Draw the solid red obstacle
+            ax.add_patch(Circle((cx, cy), radius, fill=True, color='red', alpha=0.3))
+            
+            # Draw the dotted orange inflation boundary
+            ax.add_patch(Circle((cx, cy), radius + INFLATION_BUFFER, 
+                                fill=False, color='orange', linestyle='--', linewidth=1.5))
+        
+        # 2. Rectangular Obstacles
+        for rect in RECT_OBSTACLES:
+            cx, cy, L, W, angle = rect
+            
+            # Draw the solid red obstacle
+            rect_patch = Rectangle((cx - L/2, cy - W/2), L, W, fill=True, color='red', alpha=0.3)
+            t = transforms.Affine2D().rotate_deg_around(cx, cy, angle) + ax.transData
+            rect_patch.set_transform(t)
+            ax.add_patch(rect_patch)
+            
+            # Draw the dotted orange inflation boundary
+            # We expand the Length and Width by the buffer on all sides
+            inf_L = L + (2 * INFLATION_BUFFER)
+            inf_W = W + (2 * INFLATION_BUFFER)
+            inf_patch = Rectangle((cx - inf_L/2, cy - inf_W/2), inf_L, inf_W, 
+                                  fill=False, color='orange', linestyle='--', linewidth=1.5)
+            inf_patch.set_transform(t) # Apply the exact same rotation!
+            ax.add_patch(inf_patch)
         
         # Draw Global Paths and Initialize Agent Visuals
         body_patches, heading_lines, trail_lines = {}, {}, {}

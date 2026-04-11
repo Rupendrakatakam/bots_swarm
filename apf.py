@@ -1,3 +1,13 @@
+"""
+Artificial Potential Field (APF) - Local Path Planning
+F_att = -k_att * (q - goal)
+F_rep = k_rep * (1/rho - 1/rho_0) * (1/rho^2) * (grad(rho))
+F_total = F_att + F_rep
+
+
+
+"""
+
 import numpy as np
 from geometry import get_closest_point_on_circle, get_closest_point_on_rect
 
