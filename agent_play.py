@@ -18,9 +18,9 @@ RECT_OBSTACLES = []
 # Define Multi-Agent Data
 AGENTS_DATA = {
     'A': {'start': (2.0, 2.0, math.pi/4), 'goal': (18.0, 18.0, 0.0), 'color': 'blue'},
-    'B': {'start': (18.0, 2.0, 3*math.pi/4), 'goal': (2.0, 18.0, math.pi), 'color': 'green'},
-    'C': {'start': (2.0, 18.0, 3*math.pi/4), 'goal': (18.0, 2.0, math.pi), 'color': 'red'},
-    'D': {'start': (18.0, 18.0, 3*math.pi/4), 'goal': (2.0, 2.0, math.pi), 'color': 'yellow'},
+    'B': {'start': (2.0, 7.0, 3*math.pi/4), 'goal': (18.0, 2.0, math.pi), 'color': 'green'},
+    'C': {'start': (7.0, 3.0, 3*math.pi/4), 'goal': (2.0, 18.0, math.pi), 'color': 'red'},
+    'D': {'start': (7.0, 7.0, 3*math.pi/4), 'goal': (2.0, 2.0, math.pi), 'color': 'yellow'},
 }
 
 def run_simulation():

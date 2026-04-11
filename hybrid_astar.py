@@ -33,9 +33,9 @@ class HybridAStar:
         self.agent_id = agent_id
         self.constraints = constraints if constraints else []  # List of (agent_id, x, y, time_step)
         
-        self.XY_RESO = 0.5       
-        self.YAW_RESO = math.radians(15) 
-        self.dt = 0.5
+        self.XY_RESO = 0.5   # 0.5 meter resolution for x and y
+        self.YAW_RESO = math.radians(15)  # 15 degrees resolution for yaw
+        self.dt = 0.5 # time step for simulation
 
         self.controls = [(1.0, 0.0), (1.0, 0.5), (1.0, -0.5), (0.0, 1.0), (0.0, -1.0)]
 
@@ -116,7 +116,8 @@ class HybridAStar:
                 turn_penalty = abs(w) * 0.5 
                 child.g = current.g + (v * self.dt) + turn_penalty
                 child.h = self._heuristic(child.x, child.y)
-                child.f = child.g + child.h
+                weight = 1.5  # Increase to 2.0 or 3.0 for even faster, but slightly less optimal, paths
+                child.f = child.g + (weight * child.h)
                 
                 heapq.heappush(open_list, child)
                 
