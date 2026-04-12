@@ -27,3 +27,11 @@ Python-RVO2/build/
 Python-RVO2/*.egg-info/
 Python-RVO2/__pycache__/
 Python-RVO2/src/rvo2.cpp
+
+#node_modules
+/node_modules/
+
+package-lock.json
+package.json
+
+generate_report.js
