@@ -1,4 +1,3 @@
-# geometry.py
 import math
 import numpy as np
 
@@ -22,16 +21,17 @@ def get_closest_point_on_rect(q, rect):
     dx = q[0] - cx
     dy = q[1] - cy
     
-    # 2. Rotate vector to match the rectangle's local coordinate frame
+    # 2. Local coordinate frame (Rotate by -theta)
     lx = dx * math.cos(theta) + dy * math.sin(theta)
     ly = -dx * math.sin(theta) + dy * math.cos(theta)
     
-    # 3. Clamp the point to the physical boundaries of the rectangle
+    # 3. Clamp to physical boundaries
     px = max(-L/2.0, min(L/2.0, lx))
     py = max(-W/2.0, min(W/2.0, ly))
     
-    # 4. Rotate the closest point back to global coordinates
-    qx = px * math.cos(-theta) - py * math.sin(-theta) + cx
-    qy = px * math.sin(-theta) + py * math.cos(-theta) + cy
+    # 4. Global coordinates (Rotate by +theta)
+    # BUG FIX: The sine signs were flipped here in the previous version!
+    qx = px * math.cos(theta) - py * math.sin(theta) + cx
+    qy = px * math.sin(theta) + py * math.cos(theta) + cy
     
     return np.array([qx, qy])

@@ -33,7 +33,7 @@ class HybridAStar:
         self.agent_id = agent_id
         self.constraints = constraints if constraints else []  # List of (agent_id, x, y, time_step)
         
-        self.XY_RESO = 0.5   # 0.5 meter resolution for x and y
+        self.XY_RESO = 0.2   # 0.5 meter resolution for x and y
         self.YAW_RESO = math.radians(15)  # 15 degrees resolution for yaw
         self.dt = 0.5 # time step for simulation
 
