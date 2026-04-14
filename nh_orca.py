@@ -107,6 +107,7 @@ class NHKinematicMapper:
 
     def __init__(self, cfg: DiffDriveConfig):
         self.cfg = cfg
+        self._last_region = 'R_A1'   # diagnostic
 
     def holonomic_to_controls(
         self,
@@ -163,19 +164,19 @@ class NHKinematicMapper:
         w_needed = theta_err / T
 
         if abs(w_needed) <= w_max:
-            # R_A1
             omega = w_needed
             v     = min(_optimal_v(V_H, theta_err), v_lim_for_omega(omega), v_max)
             v     = max(v, 0.0)
+            self._last_region = 'R_A1'
         else:
             omega = math.copysign(w_max, theta_err)
             v_opt = _optimal_v(V_H, theta_err)
             if v_opt <= v_lim_for_omega(omega):
-                # R_A2
                 v = v_opt
+                self._last_region = 'R_A2'
             else:
-                # R_B
                 v = 0.0
+                self._last_region = 'R_B'   # ← stop-and-spin: most jitter source
 
         return (float(np.clip(v, 0.0, v_max)),
                 float(np.clip(omega, -w_max, w_max)))
@@ -214,16 +215,16 @@ class AllowedHolonomicVelocities:
         pt   = np.array([vx, vy])
         if _point_in_convex_polygon(pt, poly):
             return vx, vy
+        # Binary search: find largest scale s.t. s*pt is inside polygon
         lo, hi = 0.0, 1.0
         for _ in range(24):
             mid = (lo + hi) / 2.0
-            (_lo := lo) if _point_in_convex_polygon(mid * pt, poly) else None
             if _point_in_convex_polygon(mid * pt, poly):
                 lo = mid
             else:
                 hi = mid
-        r = lo * pt
-        return float(r[0]), float(r[1])
+        result = lo * pt
+        return float(result[0]), float(result[1])
 
     def _build(self) -> np.ndarray:
         pts = []
@@ -423,6 +424,11 @@ class NHORCAPlanner:
         self.cfg    = cfg
         self.mapper = NHKinematicMapper(cfg)
         self.pahv   = AllowedHolonomicVelocities(cfg)
+        # Diagnostic slots (populated each update() call)
+        self._last_n_halfplanes = 0
+        self._last_pref_vel     = np.zeros(2)
+        self._last_safe_vel     = np.zeros(2)
+        self._last_pref_clipped = np.zeros(2)
 
     def update(
         self,
@@ -431,19 +437,29 @@ class NHORCAPlanner:
         my_yaw:    float,
         pref_vel:  Tuple[float, float],
         neighbors: List[SwarmAgent]
-    ) -> Tuple[float, float]:     # (v [m/s], ω [rad/s])
-        cfg  = self.cfg
-        ego  = SwarmAgent(
+    ) -> Tuple[float, float]:
+        cfg = self.cfg
+        ego = SwarmAgent(
             pos       = np.array(my_pos,  dtype=float),
             vel       = np.array(my_vel,  dtype=float),
             radius    = cfg.inflated_radius,
             max_speed = cfg.max_linear_speed
         )
         pref = np.array(pref_vel, dtype=float)
-        spd  = np.linalg.norm(pref)
+
+        # Clip magnitude to max speed
+        spd = np.linalg.norm(pref)
         if spd > cfg.max_linear_speed:
             pref *= cfg.max_linear_speed / spd
 
+        # ── Step 1: Pre-clip V_pref to P_AHV ─────────────────────────────────
+        # This gives the LP an ACHIEVABLE target.
+        # Without this, when Robot B faces northwest but wants to go southeast,
+        # P_AHV excludes the whole southeast region from the LP feasible set
+        # → fallback LP → zero velocity → robot frozen.
+        pref[0], pref[1] = self.pahv.clip_velocity(pref[0], pref[1], my_yaw)
+
+        # ── Step 2: Build ORCA half-planes (swarm only) ───────────────────────
         halfplanes: List[HalfPlane] = []
         for nb in neighbors:
             if np.linalg.norm(nb.pos - ego.pos) > cfg.neighbor_dist:
@@ -452,11 +468,22 @@ class NHORCAPlanner:
             if hp is not None:
                 halfplanes.append(hp)
 
-        pahv_poly = self.pahv.get_polygon(my_yaw)
-        v_safe    = solve_lp(halfplanes, pref, cfg.max_linear_speed, pahv_poly)
+        # ── Step 3: LP — half-planes + speed disc only (NO P_AHV) ────────────
+        # P_AHV is NOT a hard LP constraint.
+        # The pre-clip already steered pref_vel into the achievable set.
+        # Passing pahv_polygon=None keeps the feasible region convex and large.
+        v_safe = solve_lp(halfplanes, pref, cfg.max_linear_speed, pahv_polygon=None)
+
+        # ── Step 4: Post-clip (safety net) ───────────────────────────────────
         v_safe[0], v_safe[1] = self.pahv.clip_velocity(v_safe[0], v_safe[1], my_yaw)
 
-        return self.mapper.holonomic_to_controls(v_safe[0], v_safe[1], my_yaw)
+        # ── Diagnostics (read by PipelineLogger) ─────────────────────────
+        self._last_n_halfplanes   = len(halfplanes)
+        self._last_pref_vel       = pref.copy()
+        self._last_safe_vel       = v_safe.copy()
+        self._last_pref_clipped   = pref.copy()   # after pre-clip
+
+        return float(v_safe[0]), float(v_safe[1])
 
 
 # ─────────────────────────────────────────────────────────────────────────────

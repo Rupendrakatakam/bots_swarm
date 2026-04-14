@@ -157,16 +157,16 @@ class DynamicObstacle:
 class APF:
     """
     Artificial Potential Fields — Phase 3 "The Shield".
- 
+
     WHAT IT DOES (in plain English)
     --------------------------------
     Imagine the robot lives in a hilly landscape:
       • The GOAL is a deep valley — the robot rolls downhill toward it.
       • Every OBSTACLE is a sharp mountain — the robot is pushed away.
       • The OUTPUT is the slope (gradient) at the robot's current position.
- 
+
     The robot follows this slope at every control tick.
- 
+
     PARAMETERS
     ----------
     k_att       : Attractive gain.  Larger = robot chases goal more aggressively.
@@ -183,104 +183,113 @@ class APF:
                   Breaks head-on deadlocks where two forces cancel perfectly.
                   Typical range: 0.3 – 0.7
     """
- 
+
     def __init__(
         self,
-        k_att:        float = 1.0,
-        k_rep:        float = 2.0,
-        rho_0:        float = 1.5,
-        max_force:    float = 5.0,
-        vortex_gain:  float = 0.4,
+        k_att: float = 1.0,
+        k_rep: float = 2.0,
+        rho_0: float = 1.5,
+        max_force: float = 5.0,
+        vortex_gain: float = 0.4,
         static_circles: Optional[List[CircleObstacle]] = None,
-        static_rects:   Optional[List[RectObstacle]]   = None,
+        static_rects: Optional[List[RectObstacle]] = None,
+        enable_static_repulsion: bool = True,
     ):
-        self.k_att       = k_att
-        self.k_rep       = k_rep
-        self.rho_0       = rho_0
-        self.max_force   = max_force
+        self.k_att = k_att
+        self.k_rep = k_rep
+        self.rho_0 = rho_0
+        self.max_force = max_force
         self.vortex_gain = vortex_gain
- 
+
         # Static obstacles (set once at startup from the map)
         self.static_circles = static_circles or []
-        self.static_rects   = static_rects   or []
- 
-    # ── Main entry point ──────────────────────────────────────────────────
- 
+        self.static_rects = static_rects or []
+        self.enable_static_repulsion = enable_static_repulsion
+
+    # ── Main entry point ──────────────────────────────────────
+
     def get_force(
         self,
-        robot_pos:         Tuple[float, float],
-        goal_pos:          Tuple[float, float],
+        robot_pos: Tuple[float, float],
+        goal_pos: Tuple[float, float],
         dynamic_obstacles: Optional[List[DynamicObstacle]] = None,
     ) -> np.ndarray:
         """
         Compute the total APF force on the robot.
- 
+
         Parameters
         ----------
-        robot_pos          : (x, y) robot's current position
-        goal_pos           : (x, y) current carrot / waypoint from A*
-        dynamic_obstacles  : list of DynamicObstacle objects from the camera.
-                             Pass [] or None if no unknowns are detected.
-                             NEVER pass swarm agents here — use NH-ORCA for those.
- 
+        robot_pos : (x, y) robot's current position
+        goal_pos : (x, y) current carrot / waypoint from A*
+        dynamic_obstacles : list of DynamicObstacle objects from the camera.
+        Pass [] or None if no unknowns are detected.
+        NEVER pass swarm agents here — use NH-ORCA for those.
+
         Returns
         -------
         force : np.ndarray shape (2,)
-            A 2D velocity-space vector.  Units: [m/s] (when gains are tuned).
-            This becomes F_unknown in the intention blender.
- 
+        A 2D velocity-space vector. Units: [m/s] (when gains are tuned).
+        This becomes F_unknown in the intention blender.
+
         HOW TO READ THE OUTPUT
         ----------------------
         force = [1.2, -0.3]
-            → push 1.2 m/s to the right (east)
-            → push -0.3 m/s downward (south)
+        → push 1.2 m/s to the right (east)
+        → push -0.3 m/s downward (south)
         force = [0, 0]
-            → no obstacles nearby; attractive pull exactly cancelled; at goal
+        → no obstacles nearby; attractive pull exactly cancelled; at goal
         """
-        q    = np.array(robot_pos, dtype=float)
-        goal = np.array(goal_pos,  dtype=float)
- 
+        q = np.array(robot_pos, dtype=float)
+        goal = np.array(goal_pos, dtype=float)
+
         F_att = self._attractive(q, goal)
-        F_rep = self._repulsive_static(q)
+        F_rep = np.zeros(2)
+
+        if self.enable_static_repulsion:
+            F_rep += self._repulsive_static(q)
+
         F_rep += self._repulsive_dynamic(q, dynamic_obstacles or [])
- 
-        # Clamp total repulsive force to prevent singularity blow-up
+
         rep_mag = np.linalg.norm(F_rep)
         if rep_mag > self.max_force:
             F_rep = F_rep * (self.max_force / rep_mag)
- 
+
         return F_att + F_rep
- 
+
     def get_repulsive_only(
         self,
-        robot_pos:         Tuple[float, float],
+        robot_pos: Tuple[float, float],
         dynamic_obstacles: Optional[List[DynamicObstacle]] = None,
     ) -> np.ndarray:
         """
         Return ONLY the repulsive component F_unknown (no attraction).
- 
+
         This is the correct output to use in the integration pipeline.
         The attractive component is handled separately by the waypoint tracker.
- 
+
         See architecture doc:
-            V_pref = V_path (from waypoint tracker) + F_unknown (from here)
+        V_pref = V_path (from waypoint tracker) + F_unknown (from here)
         """
-        q     = np.array(robot_pos, dtype=float)
-        F_rep = self._repulsive_static(q)
+        q = np.array(robot_pos, dtype=float)
+        F_rep = np.zeros(2)
+
+        if self.enable_static_repulsion:
+            F_rep += self._repulsive_static(q)
+
         F_rep += self._repulsive_dynamic(q, dynamic_obstacles or [])
- 
+
         rep_mag = np.linalg.norm(F_rep)
         if rep_mag > self.max_force:
             F_rep = F_rep * (self.max_force / rep_mag)
- 
+
         return F_rep
- 
-    # ── Internal force components ─────────────────────────────────────────
- 
+
+    # ── Internal force components ─────────────────────────
+
     def _attractive(self, q: np.ndarray, goal: np.ndarray) -> np.ndarray:
         """
         Linear attractive force: F_att = -k_att * (robot - goal)
- 
+
         WHY LINEAR (not quadratic)?
         Linear gives constant "pull velocity" regardless of distance.
         Quadratic would pull harder far away and weaker near the goal,
@@ -288,28 +297,28 @@ class APF:
         Linear is simpler and works well as a velocity reference.
         """
         return -self.k_att * (q - goal)
- 
+
     def _repulsive_static(self, q: np.ndarray) -> np.ndarray:
         """
         Repulsion from static map obstacles (walls, pillars).
- 
+
         Formula (standard APF):
             magnitude = k_rep * (1/ρ - 1/ρ₀) * (1/ρ²)
             direction = unit vector from obstacle surface toward robot
- 
+
         WHERE
             ρ   = distance from robot to obstacle surface
             ρ₀  = influence radius (obstacles outside are ignored)
         """
         F_rep = np.zeros(2)
- 
+
         # Collect nearest surface points from all static obstacles
         surface_points = []
         for obs in self.static_circles:
             surface_points.append(obs.closest_point(q))
         for obs in self.static_rects:
             surface_points.append(obs.closest_point(q))
- 
+
         for pt in surface_points:
             rho = np.linalg.norm(q - pt)
             rho = max(rho, 0.01)          # floor to avoid division by zero
@@ -317,56 +326,56 @@ class APF:
                 mag  = self.k_rep * (1.0 / rho - 1.0 / self.rho_0) / (rho ** 2)
                 dirn = (q - pt) / rho
                 F_rep += mag * dirn
- 
+
         return F_rep
- 
+
     def _repulsive_dynamic(
         self, q: np.ndarray, obstacles: List[DynamicObstacle]
     ) -> np.ndarray:
         """
         Repulsion from UNKNOWN dynamic obstacles (camera blobs).
- 
+
         KEY DIFFERENCES from static repulsion
         ---------------------------------------
         1. Distance is measured to the SURFACE of the obstacle (ρ = dist - r_obs)
            so the force accounts for the object's physical size.
- 
+
         2. A VORTEX component is added tangentially.
            WHY: If a robot and a dynamic obstacle are heading exactly
            toward each other head-on, the repulsive forces are perfectly
            symmetric and cancel out → deadlock / collision.
            Adding a small tangential "spin" breaks this symmetry,
            causing the robot to curve around the obstacle.
- 
+
         3. A PRIORITY MULTIPLIER scales the force per obstacle.
            Larger or faster-looking objects can be assigned priority > 1.0
            to trigger stronger avoidance without changing the global gain.
         """
         F_rep = np.zeros(2)
- 
+
         for obs in obstacles:
             diff = q - obs.pos
             dist = np.linalg.norm(diff)
- 
+
             # Distance to obstacle SURFACE (not centre)
             rho = dist - obs.radius
             rho = max(rho, 0.05)          # min 5 cm — safety floor
- 
+
             if rho >= self.rho_0:
                 continue                  # outside influence radius, skip
- 
+
             # ── Radial repulsion ─────────────────────────────────────────
             k_eff = self.k_rep * obs.priority
             mag   = k_eff * (1.0 / rho - 1.0 / self.rho_0) / (rho ** 2)
- 
+
             # Direction: from obstacle centre toward robot
             if dist < 1e-9:
                 radial_dir = np.array([1.0, 0.0])     # fallback if exactly overlapping
             else:
                 radial_dir = diff / dist
- 
+
             F_radial = mag * radial_dir
- 
+
             # ── Vortex (tangential) force ─────────────────────────────────
             # Rotate radial direction 90° counter-clockwise
             # This causes the robot to curve LEFT around the obstacle.
@@ -374,23 +383,23 @@ class APF:
             #  and oscillating left-right.)
             tangent   = np.array([-radial_dir[1], radial_dir[0]])
             F_vortex  = (mag * self.vortex_gain) * tangent
- 
+
             F_rep += F_radial + F_vortex
- 
+
         return F_rep
- 
-    # ── Utility: update static obstacles at runtime ───────────────────────
- 
+
+    # ── Utility: update static obstacles at runtime ──────────────────────
+
     def add_static_circle(self, cx: float, cy: float, radius: float):
         """Add a circular static obstacle (e.g., discovered pillar)."""
         self.static_circles.append(CircleObstacle(cx, cy, radius))
- 
+
     def add_static_rect(
         self, x_min: float, y_min: float, x_max: float, y_max: float
     ):
         """Add a rectangular static obstacle (e.g., wall segment)."""
         self.static_rects.append(RectObstacle(x_min, y_min, x_max, y_max))
- 
+
     def clear_static_obstacles(self):
         """Reset static obstacle list (call when map changes)."""
         self.static_circles.clear()

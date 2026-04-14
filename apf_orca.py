@@ -42,6 +42,12 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.patches import Circle, FancyArrow
+from geometry import get_closest_point_on_circle, get_closest_point_on_rect
+
+from hybrid_astar import HybridAStar
 from apf import APF, DynamicObstacle, CircleObstacle, RectObstacle
 from nh_orca import (
     NHORCAPlanner, DiffDriveConfig, SwarmAgent,
@@ -111,6 +117,201 @@ class WheelCommand:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PIPELINE LOGGER — per-tick diagnostic for every phase
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PipelineLogger:
+    """
+    Attaches to a RobotController and records one LogEntry per tick.
+
+    WHAT EACH FIELD ANSWERS
+    -----------------------
+    apf_active        : Was APF actually doing anything? (F_unknown magnitude > 0.01)
+                        If True WITH camera_blobs=[] → APF is firing on static obstacles
+                        only. Check if static rects/circles are too close to the path.
+
+    apf_force_mag     : How hard APF pushed this tick [m/s].
+                        Spikes here = robot near a static obstacle.
+                        Sustained non-zero with no blobs = static repulsion fighting path.
+
+    orca_active       : Did ORCA compute any half-planes? (n_halfplanes > 0)
+                        If False the entire time → robots never come close enough
+                        for ORCA to trigger. Check neighbor_dist.
+
+    orca_n_halfplanes : How many constraints the LP had to solve.
+                        0 = ORCA idle. 1-2 = normal. 3+ = crowded space.
+
+    orca_adjustment   : ||V_safe - V_pref|| [m/s] — how much ORCA shifted the velocity.
+                        High values = ORCA is doing heavy dodging.
+                        If orca_active=True but orca_adjustment≈0 → V_pref was already safe.
+
+    kinematic_region  : Which NH region was selected this tick.
+                        R_A1 = normal driving.
+                        R_A2 = tight turn while moving.
+                        R_B  = stop-and-spin ← primary jitter source.
+                        Repeated R_B → orientation_time T is too small, or
+                        V_safe direction keeps flipping (caused by APF/ORCA fighting).
+
+    v_path_mag        : Speed from waypoint tracker [m/s].
+                        If near zero → robot is stalling on waypoint (increase carrot_steps).
+
+    v_pref_mag        : Speed after intention blend [m/s].
+                        v_pref_mag < v_path_mag → APF is fighting path (pushing backwards).
+
+    v_safe_mag        : Speed after ORCA [m/s].
+                        v_safe_mag << v_pref_mag → ORCA is heavily braking.
+
+    cmd_v / cmd_omega : Final wheel commands sent.
+    """
+
+    from dataclasses import dataclass as _dc
+
+    @_dc
+    class LogEntry:
+        step:               int
+        robot_id:           str
+        pos:                tuple
+        # Phase 2
+        v_path_mag:         float
+        # Phase 3 (APF)
+        apf_active:         bool
+        apf_force_mag:      float
+        n_camera_blobs:     int
+        # Phase 4 (blend)
+        v_pref_mag:         float
+        # Phase 5 (ORCA)
+        orca_active:        bool
+        orca_n_halfplanes:  int
+        orca_adjustment:    float
+        # Phase 6 (kinematics)
+        kinematic_region:   str
+        heading_error_deg:  float
+        v_safe_mag:         float
+        cmd_v:              float
+        cmd_omega:          float
+
+    def __init__(self, robot_id: str, print_every: int = 50):
+        self.robot_id    = robot_id
+        self.print_every = print_every
+        self.entries: List['PipelineLogger.LogEntry'] = []
+        self._step       = 0
+
+    def record(
+        self,
+        pos:            tuple,
+        v_path:         np.ndarray,
+        f_unknown:      np.ndarray,
+        v_pref:         np.ndarray,
+        n_camera_blobs: int,
+        orca_planner,                  # NHORCAPlanner instance
+        mapper,                        # MotorMapper instance
+        cmd:            'WheelCommand',
+        yaw:            float,
+    ):
+        import math
+        apf_mag  = float(np.linalg.norm(f_unknown))
+        pref_mag = float(np.linalg.norm(v_pref))
+        safe_mag = float(np.linalg.norm(
+            getattr(orca_planner, '_last_safe_vel', np.zeros(2))
+        ))
+        n_hp     = getattr(orca_planner, '_last_n_halfplanes', 0)
+        pref_clipped = getattr(orca_planner, '_last_pref_clipped', v_pref)
+        adjustment = float(np.linalg.norm(
+            getattr(orca_planner, '_last_safe_vel', v_pref) - pref_clipped
+        ))
+
+        # Heading error: between V_pref direction and current yaw
+        if pref_mag > 1e-3:
+            theta_H = math.atan2(v_pref[1], v_pref[0])
+            h_err   = math.degrees(abs(((theta_H - yaw + math.pi) % (2*math.pi)) - math.pi))
+        else:
+            h_err = 0.0
+
+        region = getattr(orca_planner.mapper, '_last_region', '?')
+
+        entry = PipelineLogger.LogEntry(
+            step              = self._step,
+            robot_id          = self.robot_id,
+            pos               = (round(pos[0], 2), round(pos[1], 2)),
+            v_path_mag        = round(float(np.linalg.norm(v_path)), 3),
+            apf_active        = apf_mag > 0.01,
+            apf_force_mag     = round(apf_mag, 3),
+            n_camera_blobs    = n_camera_blobs,
+            v_pref_mag        = round(pref_mag, 3),
+            orca_active       = n_hp > 0,
+            orca_n_halfplanes = n_hp,
+            orca_adjustment   = round(adjustment, 3),
+            kinematic_region  = region,
+            heading_error_deg = round(h_err, 1),
+            v_safe_mag        = round(safe_mag, 3),
+            cmd_v             = round(cmd.v, 3),
+            cmd_omega         = round(cmd.omega, 3),
+        )
+        self.entries.append(entry)
+
+        if self._step % self.print_every == 0:
+            # --- ADD THESE to record() ---
+            v_path_actual_mag = round(float(np.linalg.norm(v_path)), 3)
+            v_pref_actual_mag = round(pref_mag, 3)
+            safe_vel = getattr(orca_planner, '_last_safe_vel', np.zeros(2))
+            v_safe_actual_mag = round(float(np.linalg.norm(safe_vel)), 3)
+            self._print(entry)
+
+        self._step += 1
+
+    def _print(self, e: 'PipelineLogger.LogEntry'):
+        apf_flag  = f"APF={'ON ' if e.apf_active else 'off'} ({e.apf_force_mag:.2f})"
+        orca_flag = f"ORCA={'ON ' if e.orca_active else 'off'} ({e.orca_n_halfplanes}hp)"
+        kin_flag  = f"KIN={e.kinematic_region}(herr={e.heading_error_deg:.0f}°)"
+
+        # Show the full velocity chain so we can see WHERE speed is lost
+        chain = (f"V_path={e.v_path_mag:.2f} → "
+                 f"V_pref={e.v_pref_mag:.2f} → "
+                 f"V_safe={e.v_safe_mag:.2f} → "
+                 f"cmd_v={e.cmd_v:.2f}")
+
+        print(f"[{e.robot_id}] step={e.step:4d} | {apf_flag} | {orca_flag} | "
+              f"{kin_flag} | {chain}")
+
+    def jitter_report(self):
+        """
+        Print a summary of where jitter-causing events occurred.
+        Call this after run_simulation() finishes.
+        """
+        rb_steps    = [e for e in self.entries if e.kinematic_region == 'R_B']
+        apf_on_static = [e for e in self.entries
+                         if e.apf_active and e.n_camera_blobs == 0]
+        big_orca    = [e for e in self.entries if e.orca_adjustment > 0.5]
+        big_apf     = [e for e in self.entries if e.apf_force_mag > 1.0]
+
+        print(f"\n{'='*60}")
+        print(f"JITTER REPORT — {self.robot_id}  ({len(self.entries)} steps total)")
+        print(f"{'='*60}")
+        print(f"  R_B (stop-and-spin) events   : {len(rb_steps):4d}  "
+              f"← main jitter source if high")
+        print(f"  APF active, no camera blobs  : {len(apf_on_static):4d}  "
+              f"← static obstacles fighting path")
+        print(f"  ORCA big adjustments (>0.5)  : {len(big_orca):4d}  "
+              f"← heavy swarm dodging")
+        print(f"  APF big forces (>1.0 m/s)    : {len(big_apf):4d}  "
+              f"← near static obstacle")
+
+        if rb_steps:
+            positions = [e.pos for e in rb_steps[:5]]
+            print(f"  First R_B positions          : {positions}")
+            print(f"  → Fix: increase orientation_time T or tracking_error ε")
+
+        if apf_on_static:
+            positions = [e.pos for e in apf_on_static[:5]]
+            print(f"  First no-blob APF positions  : {positions}")
+            print(f"  → Fix: reduce rho_0, or remove boundary walls from APF")
+
+        if big_orca:
+            positions = [e.pos for e in big_orca[:5]]
+            print(f"  First big ORCA positions     : {positions}")
+            print(f"  → Expected near robot crossings")
+        print(f"{'='*60}\n")
+# ─────────────────────────────────────────────────────────────────────────────
 # PHASE 1 — GLOBAL PLANNER INTERFACE
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -133,11 +334,11 @@ class GlobalPath:
 
     def set_path(self, waypoints: List[Tuple[float, float]]):
         """
-        Load a new path.  Each waypoint is (x, y).
-
+        Load a new path.  Each waypoint is (x, y, theta).
         Call this once at startup (or whenever the goal changes).
         """
-        self.waypoints = [np.array([wx, wy], dtype=float) for wx, wy in waypoints]
+        # FIX: Just grab wp[0] (x) and wp[1] (y), ignoring wp[2] (theta)
+        self.waypoints = [np.array([wp[0], wp[1]], dtype=float) for wp in waypoints]
 
     def set_straight_line_path(
         self,
@@ -333,7 +534,7 @@ class MotorMapper:
     def __init__(
         self,
         cfg:          DiffDriveConfig,
-        filter_alpha: float = 0.5,          # EMA smoothing factor
+        filter_alpha: float = 0.25,          # EMA smoothing factor
     ):
         self.cfg    = cfg
         self.alpha  = filter_alpha
@@ -449,7 +650,7 @@ class RobotController:
         robot_id: str,
         cfg:      DiffDriveConfig,
         apf:      APF,
-        filter_alpha:     float = 0.5,
+        filter_alpha:     float = 0.25,
         lookahead_window: int   = 15,
         carrot_steps:     int   = 3,
         goal_tolerance:   float = 0.15,
@@ -479,6 +680,8 @@ class RobotController:
         self._last_f_unknown = np.zeros(2)
         self._last_v_pref    = np.zeros(2)
         self._last_v_safe    = np.zeros(2)
+
+        self.logger = PipelineLogger(robot_id, print_every=100)
 
     # ── State update (call with fresh odometry) ───────────────────────────
 
@@ -566,7 +769,7 @@ class RobotController:
             )
             for t in swarm_telemetry           # ONLY swarm agents
         ]
-        v_safe_v, v_safe_w = self.orca.update(
+        v_safe_vx, v_safe_vy = self.orca.update(
             my_pos    = tuple(pos),
             my_vel    = tuple(vel),
             my_yaw    = yaw,
@@ -575,24 +778,35 @@ class RobotController:
         )
         # Reconstruct 2D V_safe from (v, ω)
         # For debug/log — actual command is already in (v, ω)
-        v_safe_2d = np.array([
-            v_safe_v * math.cos(yaw),
-            v_safe_v * math.sin(yaw)
-        ])
+        v_safe_2d = np.array([v_safe_vx, v_safe_vy])
 
         # ── Phase 6: Kinematic mapper + low-pass filter ───────────────────
+        # MotorMapper now receives the true safe holonomic direction and
+        # computes heading error → (v, ω) correctly.
         cmd = self.mapper.compute(
-            vx    = v_safe_2d[0],
-            vy    = v_safe_2d[1],
+            vx    = v_safe_vx,
+            vy    = v_safe_vy,
             yaw   = yaw,
             state = self.state,
         )
-
         # ── Save debug values ─────────────────────────────────────────────
         self._last_v_path    = v_path
         self._last_f_unknown = v_pref - v_path
         self._last_v_pref    = v_pref
         self._last_v_safe    = v_safe_2d
+
+        # ── Log this tick ─────────────────────────────────────────────────
+        self.logger.record(
+            pos            = tuple(pos),
+            v_path         = v_path,
+            f_unknown      = v_pref - v_path,
+            v_pref         = v_pref,
+            n_camera_blobs = len(camera_blobs),
+            orca_planner   = self.orca,
+            mapper         = self.mapper,
+            cmd            = cmd,
+            yaw            = yaw,
+        )
 
         return cmd
 
@@ -723,6 +937,9 @@ class FleetManager:
     def get_fleet_debug(self) -> List[Dict]:
         """Return debug info for all robots (for logging / visualisation)."""
         return [ctrl.get_debug_info() for ctrl in self.robots.values()]
+    
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -740,81 +957,212 @@ def _optimal_v(V_H: float, theta_err: float) -> float:
     c = 1.0 - math.cos(theta_err)
     return V_H if abs(c) < 1e-10 else V_H * theta_err * math.sin(theta_err) / (2.0 * c)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# QUICK INTEGRATION TEST (no ROS needed)
+# MATPLOTLIB SIMULATION RUNNER
 # ─────────────────────────────────────────────────────────────────────────────
 
-if __name__ == '__main__':
-    print("=" * 60)
-    print("INTEGRATION PIPELINE — Quick Sanity Test")
-    print("=" * 60)
+def run_simulation(
+    fleet:         FleetManager,
+    agent_data:    Dict,                  # {'robot_id': {'color': str, 'goal': (x,y)}}
+    camera_blobs:  List[CameraBlob] = None,
+    max_steps:     int   = 1500,
+    dt:            float = 0.1,
+) -> Dict[str, List[Tuple[float, float, float]]]:
+    """
+    Run the full FleetManager pipeline and collect (x, y, yaw) histories.
 
-    # ── Build config ──────────────────────────────────────────────────────
-    cfg = DiffDriveConfig(
-        robot_radius      = 0.22,
-        wheel_base        = 0.287,
-        max_linear_speed  = 0.26,
-        max_angular_speed = 1.82,
-        tracking_error    = 0.05,
-        orientation_time  = 0.5,
-    )
+    Parameters
+    ----------
+    fleet        : configured FleetManager with robots already added + goals set
+    agent_data   : dict keyed by robot_id with 'color' and 'goal' fields
+    camera_blobs : static list of unknown obstacles (or None)
+    max_steps    : safety cutoff
+    dt           : must match fleet.cfg.sim_dt
 
-    # ── Build APF with some static obstacles ─────────────────────────────
-    apf = APF(
-        k_att     = 1.0,
-        k_rep     = 2.0,
-        rho_0     = 1.5,
-        max_force = 5.0,
-        static_circles = [CircleObstacle(3.0, 0.5, 0.3)],
-        static_rects   = [RectObstacle(0.0, 2.0, 6.0, 2.2)],
-    )
+    Returns
+    -------
+    histories : Dict[robot_id → list of (x, y, yaw)]
+    """
+    camera_blobs = camera_blobs or []
+    histories    = {rid: [] for rid in fleet.robots}
 
-    # ── Create fleet ──────────────────────────────────────────────────────
-    fleet = FleetManager(cfg, apf)
+    # Record initial positions
+    for rid, ctrl in fleet.robots.items():
+        p = ctrl.state.pose
+        histories[rid].append((p.x, p.y, p.yaw))
 
-    robot_a = fleet.add_robot('robot_A', filter_alpha=0.5)
-    robot_b = fleet.add_robot('robot_B', filter_alpha=0.5)
-
-    # ── Set initial states ────────────────────────────────────────────────
-    fleet.update_state('robot_A', x=0.0,  y=0.0,  yaw=0.0,         vx=0.1, vy=0.0)
-    fleet.update_state('robot_B', x=6.0,  y=0.0,  yaw=math.pi,     vx=-0.1, vy=0.0)
-
-    # ── Set goals (head-on collision scenario) ────────────────────────────
-    fleet.set_goal('robot_A', 6.0, 0.0)
-    fleet.set_goal('robot_B', 0.0, 0.0)
-
-    robot_a.path.set_straight_line_path((0.0, 0.0), (6.0, 0.0))
-    robot_b.path.set_straight_line_path((6.0, 0.0), (0.0, 0.0))
-
-    # ── Simulate 5 ticks ──────────────────────────────────────────────────
-    camera_blobs = [CameraBlob(x=3.0, y=1.0, radius=0.3, priority=1.5)]
-
-    print(f"\n{'Tick':<5} {'Robot':<10} {'v':>6} {'ω':>7} {'vl':>7} {'vr':>7}")
-    print("-" * 50)
-
-    for tick in range(5):
+    for step in range(max_steps):
+        # ── Run one pipeline tick ─────────────────────────────────────────
         commands = fleet.tick_all(camera_blobs=camera_blobs)
+
+        all_reached = all(fleet.robots[rid].reached_goal for rid in fleet.robots)
+
+        # ── Euler integration: propagate each robot's state ───────────────
         for rid, cmd in commands.items():
-            print(f"{tick:<5} {rid:<10} "
-                  f"{cmd.v:>6.3f} {cmd.omega:>7.3f} "
-                  f"{cmd.vl:>7.3f} {cmd.vr:>7.3f}")
-
-        # Simulate motion (very crude Euler integration for test only)
-        dt = cfg.sim_dt
-        for rid in ['robot_A', 'robot_B']:
             ctrl = fleet.robots[rid]
-            cmd  = commands[rid]
-            x    = ctrl.state.pose.x + ctrl.state.vel[0] * dt
-            y    = ctrl.state.pose.y + ctrl.state.vel[1] * dt
-            yaw  = ctrl.state.pose.yaw + cmd.omega * dt
-            vx   = cmd.v * math.cos(yaw)
-            vy   = cmd.v * math.sin(yaw)
-            fleet.update_state(rid, x, y, yaw, vx, vy)
+            p    = ctrl.state.pose
 
-    print("\nDebug info (last tick):")
-    for dbg in fleet.get_fleet_debug():
-        print(f"  {dbg['robot_id']}: pos={dbg['pos']}  "
-              f"v_pref={dbg['v_pref']}  v_safe={dbg['v_safe']}")
+            new_yaw = p.yaw + cmd.omega * dt
+            new_x   = p.x   + cmd.v * math.cos(new_yaw) * dt
+            new_y   = p.y   + cmd.v * math.sin(new_yaw) * dt
 
-    print("\nAll phases executed correctly.")
+            # --- END OF run_simulation() LOOP ---
+            vx = cmd.v * math.cos(new_yaw)
+            vy = cmd.v * math.sin(new_yaw)
+
+            fleet.update_state(rid, new_x, new_y, new_yaw, vx, vy)
+            histories[rid].append((new_x, new_y, new_yaw))
+
+        if all_reached:
+            print(f"All goals reached at step {step}.")
+            break
+
+    return histories
+
+
+
+def build_figure(
+    fleet:        FleetManager,
+    agent_data:   Dict,
+    global_paths: Dict,                   # robot_id → list of (x, y) or (x, y, θ)
+    histories:    Dict,
+    world_size:   float = 20.0,
+    static_circles: List = None,          # list of CircleObstacle
+    static_rects:   List = None,          # list of RectObstacle
+):
+    """
+    Build and return the (fig, ax, artists, update_fn) needed for FuncAnimation.
+    """
+    static_circles = static_circles or []
+    static_rects   = static_rects   or []
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_xlim(0, world_size)
+    ax.set_ylim(0, world_size)
+    ax.set_aspect('equal')
+    ax.set_title('Multi-Agent Navigation: APF + NH-ORCA Pipeline', fontsize=14)
+    ax.set_xticks(np.arange(0, world_size + 1, 1))
+    ax.set_yticks(np.arange(0, world_size + 1, 1))
+    ax.grid(True, linestyle=':', alpha=0.5)
+
+    INFLATE = fleet.cfg.inflated_radius - fleet.cfg.robot_radius  # = ε
+
+    # ── Static obstacles ──────────────────────────────────────────────────
+    for obs in static_circles:
+        ax.add_patch(Circle((obs.cx, obs.cy), obs.radius,
+                            fill=True, color='red', alpha=0.35, zorder=2))
+        ax.add_patch(Circle((obs.cx, obs.cy), obs.radius + INFLATE,
+                            fill=False, color='orange', linestyle='--',
+                            linewidth=1.2, zorder=2))
+
+    for obs in static_rects:
+        x0, y0, x1, y1 = obs.bounds
+        from matplotlib.patches import Rectangle
+        ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0,
+                                fill=True, color='red', alpha=0.35, zorder=2))
+        ax.add_patch(Rectangle((x0 - INFLATE, y0 - INFLATE),
+                                (x1 - x0) + 2 * INFLATE,
+                                (y1 - y0) + 2 * INFLATE,
+                                fill=False, color='orange', linestyle='--',
+                                linewidth=1.2, zorder=2))
+
+    # ── Global path lines (dashed) ────────────────────────────────────────
+    for rid, path in global_paths.items():
+        color = agent_data[rid]['color']
+        px = [p[0] for p in path]
+        py = [p[1] for p in path]
+        ax.plot(px, py, color=color, linestyle='--', linewidth=1.5,
+                alpha=0.4, zorder=1)
+
+    # ── Goal markers ──────────────────────────────────────────────────────
+    for rid, data in agent_data.items():
+        gx, gy = data['goal']
+        color  = data['color']
+        ax.scatter(gx, gy, s=220, c=color, marker='*', zorder=5)
+        ax.annotate(f"Goal {rid}", (gx, gy),
+                    textcoords='offset points', xytext=(6, 6), fontsize=8)
+
+    # ── Per-robot dynamic artists ─────────────────────────────────────────
+    r = fleet.cfg.robot_radius
+    L = fleet.cfg.wheel_base
+
+    body_patches  = {}
+    heading_lines = {}
+    trail_lines   = {}
+    left_wheels   = {}
+    right_wheels  = {}
+
+    for rid, data in agent_data.items():
+        color = data['color']
+        x0, y0, _ = histories[rid][0]
+
+        body_patches[rid] = Circle((x0, y0), r, fill=True,
+                                   color=color, alpha=0.6, zorder=4)
+        ax.add_patch(body_patches[rid])
+
+        heading_lines[rid], = ax.plot([], [], color='black',
+                                      linewidth=2, zorder=5)
+        trail_lines[rid],   = ax.plot([], [], color=color,
+                                      linewidth=1.8, alpha=0.65, zorder=3)
+        left_wheels[rid],   = ax.plot([], [], color='black',
+                                      linewidth=4, solid_capstyle='round', zorder=5)
+        right_wheels[rid],  = ax.plot([], [], color='black',
+                                      linewidth=4, solid_capstyle='round', zorder=5)
+
+    # ── Step counter text ─────────────────────────────────────────────────
+    step_text = ax.text(0.02, 0.97, '', transform=ax.transAxes,
+                        fontsize=10, verticalalignment='top')
+
+    # ── Update function ───────────────────────────────────────────────────
+    wl = L * 0.6          # visual wheel length
+
+    def update(frame):
+        artists = [step_text]
+        step_text.set_text(f'Step: {frame}')
+
+        for rid in agent_data:
+            hist = histories[rid]
+            f    = min(frame, len(hist) - 1)
+            x, y, theta = hist[f]
+
+            # Trail
+            trail_lines[rid].set_data(
+                [p[0] for p in hist[:f + 1]],
+                [p[1] for p in hist[:f + 1]]
+            )
+
+            # Body
+            body_patches[rid].center = (x, y)
+
+            # Heading arrow (centre → nose)
+            heading_lines[rid].set_data(
+                [x, x + r * math.cos(theta)],
+                [y, y + r * math.sin(theta)]
+            )
+
+            # Wheel positions (perpendicular to heading)
+            # Left wheel centre
+            lx = x - (L / 2) * math.sin(theta)
+            ly = y + (L / 2) * math.cos(theta)
+            # Right wheel centre
+            rx = x + (L / 2) * math.sin(theta)
+            ry = y - (L / 2) * math.cos(theta)
+
+            # Draw each wheel as a short line along heading direction
+            left_wheels[rid].set_data(
+                [lx - wl * math.cos(theta), lx + wl * math.cos(theta)],
+                [ly - wl * math.sin(theta), ly + wl * math.sin(theta)]
+            )
+            right_wheels[rid].set_data(
+                [rx - wl * math.cos(theta), rx + wl * math.cos(theta)],
+                [ry - wl * math.sin(theta), ry + wl * math.sin(theta)]
+            )
+
+            artists.extend([
+                trail_lines[rid], body_patches[rid],
+                heading_lines[rid], left_wheels[rid], right_wheels[rid]
+            ])
+
+        return artists
+
+    return fig, update, max(len(h) for h in histories.values())
