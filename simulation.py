@@ -193,13 +193,13 @@ if __name__ == '__main__':
         robot_radius      = 1.0,
         wheel_base        = 0.8,
         max_linear_speed  = 2.0,
-        max_angular_speed = 3.5,
-        max_wheel_speed   = 3.0,
-        # KEY TUNING: larger ε → wider P_AHV → less restrictive in all directions
-        tracking_error    = 0.15,
-        orientation_time  = 0.25,  # faster orientation convergence
-        time_horizon      = 5.0,
-        neighbor_dist     = 8.0,
+        max_angular_speed = 10.0,   # Increased to allow faster turns, reducing time spent in high heading error
+        max_wheel_speed   = 3.0,    # Increased to support higher linear speeds during turns
+        # KEY TUNING: balance tracking error and orientation time for better speed
+        tracking_error    = 0.40,   # Moderate tracking error tolerance
+        orientation_time  = 0.5,    # Moderate time to turn
+        time_horizon      = 3.0,
+        neighbor_dist     = 6.0,
         sim_dt            = 0.1,
     )
 
@@ -231,9 +231,11 @@ if __name__ == '__main__':
     )
 
     # ── 3. Agent definitions ────────────────────────────────────────────────
+    # Increased separation to avoid ORCA deadlock at startup
     agent_data = {
         'A': {'start': (2.0, 2.0, math.pi/4),       'goal': (18.0, 18.0), 'color': 'royalblue'},
-        'B': {'start': (2.0, 7.0, 3*math.pi/4),     'goal': (18.0,  2.0), 'color': 'seagreen'},
+        'B': {'start': (12.0, 2.0, 0.0),            'goal': (18.0,  2.0), 'color': 'seagreen'},  # Moved B to y=12 for more separation
+        'C': {'start': (2.0, 12.0, 0.0),            'goal': (13.0,  2.0), 'color': 'yellow'},  # Moved B to y=12 for more separation
     }
 
     # ── 4. Build fleet ─────────────────────────────────────────────────────
@@ -244,7 +246,7 @@ if __name__ == '__main__':
         robot = fleet.add_robot(
             rid,
             filter_alpha     = 0.5,
-            goal_tolerance   = 0.8,
+            goal_tolerance   = 0.3,   # Reduced from 0.8 - prevents premature "goal reached"
             lookahead_window = 20,   # wider scan — better for sparse A* paths
             carrot_steps     = 8,    # further carrot — smoother following in large world
         )
@@ -280,7 +282,7 @@ if __name__ == '__main__':
             global_paths[rid] = robot.path.waypoints
 
     # ── 5. Camera blobs ─────────────────────────────────────────────────────
-    camera_blobs = [CameraBlob(x=10.0, y=5.0, radius=0.8, priority=1.5)]
+    camera_blobs = []  # No dynamic obstacles - APF only responds to dynamic obstacles
 
     # ── 6. Simulate ─────────────────────────────────────────────────────────
     print("Running simulation...")

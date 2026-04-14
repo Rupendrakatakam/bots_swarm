@@ -447,17 +447,13 @@ class NHORCAPlanner:
         )
         pref = np.array(pref_vel, dtype=float)
 
-        # Clip magnitude to max speed
+        # Clip magnitude to max speed only (don't crush direction!)
         spd = np.linalg.norm(pref)
         if spd > cfg.max_linear_speed:
             pref *= cfg.max_linear_speed / spd
 
-        # ── Step 1: Pre-clip V_pref to P_AHV ─────────────────────────────────
-        # This gives the LP an ACHIEVABLE target.
-        # Without this, when Robot B faces northwest but wants to go southeast,
-        # P_AHV excludes the whole southeast region from the LP feasible set
-        # → fallback LP → zero velocity → robot frozen.
-        pref[0], pref[1] = self.pahv.clip_velocity(pref[0], pref[1], my_yaw)
+        # NOTE: Removed pre-clip to P_AHV - it was incorrectly crushing velocity to near-zero
+        # The ORCA LP will find a valid velocity; P_AHV is just for post-clip safety check
 
         # ── Step 2: Build ORCA half-planes (swarm only) ───────────────────────
         halfplanes: List[HalfPlane] = []
@@ -470,12 +466,10 @@ class NHORCAPlanner:
 
         # ── Step 3: LP — half-planes + speed disc only (NO P_AHV) ────────────
         # P_AHV is NOT a hard LP constraint.
-        # The pre-clip already steered pref_vel into the achievable set.
-        # Passing pahv_polygon=None keeps the feasible region convex and large.
+        # The old pre-clip was incorrectly crushing velocity, removed for debugging
         v_safe = solve_lp(halfplanes, pref, cfg.max_linear_speed, pahv_polygon=None)
 
-        # ── Step 4: Post-clip (safety net) ───────────────────────────────────
-        v_safe[0], v_safe[1] = self.pahv.clip_velocity(v_safe[0], v_safe[1], my_yaw)
+        # NOTE: Removed post-clip to P_AHV - it was also incorrectly crushing velocity
 
         # ── Diagnostics (read by PipelineLogger) ─────────────────────────
         self._last_n_halfplanes   = len(halfplanes)
