@@ -90,12 +90,12 @@ def build_figure(fleet, agent_data, global_paths, histories,
                                 fill=False, color='orange', linestyle='--',
                                 linewidth=1.2, zorder=2))
 
-    # Camera blobs
-    # for blob in camera_blobs:
-    #     ax.add_patch(Circle((blob.x, blob.y), blob.radius,
-    #                         color='purple', alpha=0.25, zorder=2))
-    #     # ax.text(blob.x, blob.y + blob.radius + 0.2, 'CAM', fontsize=7,
-    #     #         ha='center', color='purple')
+    # Camera blobs - visualize unknown dynamic obstacles
+    for blob in camera_blobs:
+        ax.add_patch(Circle((blob.x, blob.y), blob.radius,
+                            color='purple', alpha=0.25, zorder=2))
+        ax.text(blob.x, blob.y + blob.radius + 0.2, 'CAM', fontsize=7,
+                ha='center', color='purple')
 
     # A* paths
     for rid, path in global_paths.items():
@@ -204,38 +204,36 @@ if __name__ == '__main__':
     )
 
     # ── 2. Obstacles ───────────────────────────────────────────────────────
-    INTERNAL_CIRCLES = [CircleObstacle(10.0,10.0,2.0)] #'cx', 'cy', and 'radius'
-    INTERNAL_RECTS   = [RectObstacle(0.0, 0.0, 0.0, 0.0)]  #'x_min', 'y_min', 'x_max', and 'y_max'
+    # No internal obstacles - straight line A* paths
+    INTERNAL_CIRCLES = []
+    INTERNAL_RECTS   = []
 
-    # Boundary walls: used ONLY by A* planner, NOT by APF.
-    # APF only handles unknown dynamic obstacles (camera blobs).
-    # Giving boundary walls to APF creates forces that fight path-following.
+    # Boundary walls for A*
     BOUNDARY_RECTS = [
-        RectObstacle(-1.0, -1.0, 21.0,  0.0),   # South
-        RectObstacle(-1.0, 20.0, 21.0, 21.0),   # North
-        RectObstacle(-1.0,  0.0,  0.0, 20.0),   # West
-        RectObstacle(20.0,  0.0, 21.0, 20.0),   # East
+        RectObstacle(-1.0, -1.0, 21.0,  0.0),
+        RectObstacle(-1.0, 20.0, 21.0, 21.0),
+        RectObstacle(-1.0,  0.0,  0.0, 20.0),
+        RectObstacle(20.0,  0.0, 21.0, 20.0),
     ]
     ALL_RECTS_FOR_ASTAR = INTERNAL_RECTS + BOUNDARY_RECTS
 
-    # APF: internal obstacles only — NO boundary walls
+    # APF: only for dynamic obstacles - no static obstacles
     apf = APF(
-        k_att          = 1.9,
-        k_rep          = 10.0,    # reduced from 16 — less fighting with A* path
-        rho_0          = 1.5,     # reduced from 2.5 — tighter influence zone
-        max_force      = 7.0,
-        vortex_gain    = 0.35,
-        static_circles = INTERNAL_CIRCLES,
-        static_rects   = INTERNAL_RECTS,   # NO boundaries here
+        k_att = 1.9,
+        k_rep = 10.0,
+        rho_0 = 1.5,
+        max_force = 7.0,
+        vortex_gain = 0.35,
+        static_circles = [],
+        static_rects = [],
         enable_static_repulsion = False,  # APF only for dynamic obstacles (camera blobs)
     )
 
     # ── 3. Agent definitions ────────────────────────────────────────────────
-    # Increased separation to avoid ORCA deadlock at startup
+    # Two robots - A will pass near camera blob at (10,5)
     agent_data = {
         'A': {'start': (2.0, 2.0, math.pi/4),       'goal': (18.0, 18.0), 'color': 'royalblue'},
-        'B': {'start': (12.0, 2.0, 0.0),            'goal': (18.0,  2.0), 'color': 'seagreen'},  # Moved B to y=12 for more separation
-        'C': {'start': (2.0, 12.0, 0.0),            'goal': (13.0,  2.0), 'color': 'yellow'},  # Moved B to y=12 for more separation
+        'B': {'start': (2.0, 12.0, 0.0),            'goal': (18.0,  2.0), 'color': 'seagreen'},
     }
 
     # ── 4. Build fleet ─────────────────────────────────────────────────────
@@ -282,7 +280,8 @@ if __name__ == '__main__':
             global_paths[rid] = robot.path.waypoints
 
     # ── 5. Camera blobs ─────────────────────────────────────────────────────
-    camera_blobs = []  # No dynamic obstacles - APF only responds to dynamic obstacles
+    # Camera blob on Robot A's path for APF visualization
+    camera_blobs = [CameraBlob(x=7.0, y=7.0, radius=1.2, priority=1.5)]
 
     # ── 6. Simulate ─────────────────────────────────────────────────────────
     print("Running simulation...")
