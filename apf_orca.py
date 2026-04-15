@@ -383,16 +383,23 @@ class WaypointTracker:
         lookahead_window: int   = 15,      # how many waypoints to scan ahead
         carrot_steps:     int   = 3,       # how many steps ahead to target
         goal_tolerance:   float = 0.15,    # [m] distance to declare "reached"
+        curvature_steps:  int   = 10,      # look ahead N steps for curvature
+        max_curvature:    float = 1.5,     # rad/m threshold to trigger braking
     ):
         self.max_speed        = max_speed
         self.lookahead_window = lookahead_window
         self.carrot_steps     = carrot_steps
         self.goal_tolerance   = goal_tolerance
+        self.curvature_steps  = curvature_steps
+        self.max_curvature    = max_curvature
         self._current_idx     = 0
+        self._prev_v_path     = np.zeros(2)
+        self.path_alpha       = 0.4  # Path velocity smoothing factor
 
     def reset(self):
         """Call this when a new path is loaded."""
         self._current_idx = 0
+        self._prev_v_path = np.zeros(2)  # Reset path smoothing
 
     def compute(
         self,
@@ -413,18 +420,15 @@ class WaypointTracker:
         wps  = path.waypoints
         n_wp = len(wps)
 
-        # ── Check if reached the final goal ───────────────────────────────
         if np.linalg.norm(robot_pos - wps[-1]) < self.goal_tolerance:
             return np.zeros(2), True
 
-        # ── Find closest waypoint in lookahead window ─────────────────────
         lo = self._current_idx
         hi = min(lo + self.lookahead_window, n_wp)
         dists = [np.linalg.norm(robot_pos - wps[i]) for i in range(lo, hi)]
         closest_local = int(np.argmin(dists))
         self._current_idx = lo + closest_local
 
-        # ── Target the carrot K steps ahead ───────────────────────────────
         carrot_idx = min(self._current_idx + self.carrot_steps, n_wp - 1)
         carrot     = wps[carrot_idx]
         diff       = carrot - robot_pos
@@ -433,8 +437,28 @@ class WaypointTracker:
         if dist < 1e-4:
             return np.zeros(2), False
 
-        speed  = min(self.max_speed, dist)   # slow down near waypoints
+        curvature_factor = 1.0
+        if n_wp > self.curvature_steps:
+            future_idx = min(self._current_idx + self.curvature_steps, n_wp - 1)
+            if future_idx > self._current_idx:
+                current_dir = wps[future_idx] - wps[self._current_idx]
+                current_dir_norm = np.linalg.norm(current_dir)
+                if current_dir_norm > 1e-4:
+                    current_dir = current_dir / current_dir_norm
+                    robot_to_carrot = diff / dist
+                    cross = abs(current_dir[0] * robot_to_carrot[1] - current_dir[1] * robot_to_carrot[0])
+                    angle_diff = math.asin(np.clip(cross, -1.0, 1.0))
+                    curvature = abs(angle_diff) / max(dist, 0.1)
+                    if curvature > self.max_curvature:
+                        curvature_factor = max(0.3, 1.0 - (curvature - self.max_curvature) / 2.0)
+
+        speed  = min(self.max_speed * curvature_factor, dist)
         V_path = speed * diff / dist
+        
+        # Smooth path velocity to reduce sudden direction changes
+        V_path = self.path_alpha * V_path + (1 - self.path_alpha) * self._prev_v_path
+        self._prev_v_path = V_path.copy()
+        
         return V_path, False
 
 
@@ -534,10 +558,14 @@ class MotorMapper:
     def __init__(
         self,
         cfg:          DiffDriveConfig,
-        filter_alpha: float = 0.25,          # EMA smoothing factor
+        filter_alpha: float = 0.25,
     ):
         self.cfg    = cfg
         self.alpha  = filter_alpha
+        self._prev_v_raw = 0.0
+        self._prev_w_raw = 0.0
+        self._prev_heading_error = 0.0
+        self.heading_alpha = 0.3  # EMA smoothing for heading
 
     def compute(
         self,
@@ -549,48 +577,65 @@ class MotorMapper:
         """
         Convert V_safe = (vx, vy) to a smoothed WheelCommand.
 
-        Parameters
-        ----------
-        vx, vy : components of V_safe from NH-ORCA
-        yaw    : current robot heading [rad]
-        state  : RobotState (used for prev_v, prev_w for EMA filter)
-
-        Returns
-        -------
-        WheelCommand with v, omega, vl, vr all filled in.
+        Uses:
+        - Acceleration limits for smooth speed transitions
+        - Coupled speed/steering: slow down when turning
         """
         cfg = self.cfg
 
-        # ── Compute heading error ─────────────────────────────────────────
         V_H = math.hypot(vx, vy)
         if V_H < 1e-4:
             cmd = WheelCommand(0.0, 0.0, 0.0, 0.0)
-            state.prev_v = 0.0
-            state.prev_w = 0.0
+            self._prev_v_raw = 0.0
+            self._prev_w_raw = 0.0
             return cmd
 
         theta_H   = math.atan2(vy, vx)
-        theta_err = _wrap_angle(theta_H - yaw)
+        theta_err_raw = _wrap_angle(theta_H - yaw)
+        
+        # Smooth heading error with EMA
+        theta_err = self.heading_alpha * theta_err_raw + (1 - self.heading_alpha) * self._prev_heading_error
+        self._prev_heading_error = theta_err
 
-        # ── Angular command (from paper Eq. 9) ───────────────────────────
         omega_raw = theta_err / cfg.orientation_time
         omega_raw = float(np.clip(omega_raw, -cfg.max_angular_speed, cfg.max_angular_speed))
 
-        # ── Linear command (from paper Eq. 8) ────────────────────────────
         v_raw = _optimal_v(V_H, theta_err)
         v_raw = float(np.clip(v_raw, 0.0, cfg.max_linear_speed))
 
-        # ── Low-pass filter (EMA shock absorber) ─────────────────────────
-        alpha = self.alpha
-        v_filt     = alpha * v_raw     + (1.0 - alpha) * state.prev_v
-        omega_filt = alpha * omega_raw + (1.0 - alpha) * state.prev_w
+        dt = cfg.sim_dt
 
-        state.prev_v = v_filt
-        state.prev_w = omega_filt
+        v_accel_limited = self._prev_v_raw + np.clip(
+            v_raw - self._prev_v_raw,
+            -cfg.max_linear_decel * dt,
+            cfg.max_linear_accel * dt
+        )
+        v_accel_limited = float(np.clip(v_accel_limited, 0.0, cfg.max_linear_speed))
 
-        # ── Unicycle → wheel speeds ───────────────────────────────────────
+        w_accel_limited = self._prev_w_raw + np.clip(
+            omega_raw - self._prev_w_raw,
+            -cfg.max_angular_accel * dt,
+            cfg.max_angular_accel * dt
+        )
+        w_accel_limited = float(np.clip(w_accel_limited, -cfg.max_angular_speed, cfg.max_angular_speed))
+
+        self._prev_v_raw = v_accel_limited
+        self._prev_w_raw = w_accel_limited
+
+        coupled_factor = 1.0 - min(abs(w_accel_limited) / cfg.max_angular_speed, 1.0) * 0.6
+        v_coupled = v_accel_limited * coupled_factor
+
         vl, vr = unicycle_to_wheels(
-            v_filt, omega_filt, cfg.wheel_base, cfg.max_wheel_speed
+            v_coupled, w_accel_limited, cfg.wheel_base, cfg.max_wheel_speed
+        )
+
+        v_actual, omega_actual = wheels_to_unicycle(vl, vr, cfg.wheel_base)
+
+        return WheelCommand(
+            v     = v_actual,
+            omega = omega_actual,
+            vl    = vl,
+            vr    = vr
         )
 
         # ── Reconstruct v, ω from clipped wheel speeds ───────────────────

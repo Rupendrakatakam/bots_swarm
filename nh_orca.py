@@ -66,17 +66,20 @@ class DiffDriveConfig:
         robot_radius=0.105, wheel_base=0.160,
         max_linear_speed=0.22, max_angular_speed=2.84
     """
-    robot_radius:      float = 0.220
-    wheel_base:        float = 0.287
-    wheel_radius:      float = 0.033
-    max_linear_speed:  float = 0.26
-    max_angular_speed: float = 1.82
-    max_wheel_speed:   float = 0.50
-    tracking_error:    float = 0.05   # ε [m]
-    orientation_time:  float = 0.50   # T [s]
-    time_horizon:      float = 5.0    # τ [s] collision lookahead
-    neighbor_dist:     float = 5.0    # [m] sensing radius
-    sim_dt:            float = 0.10   # [s] control period
+    robot_radius:        float = 0.220
+    wheel_base:          float = 0.287
+    wheel_radius:        float = 0.033
+    max_linear_speed:    float = 0.26
+    max_angular_speed:   float = 1.82
+    max_wheel_speed:     float = 0.50
+    max_linear_accel:    float = 2.0   # [m/s²] acceleration limit
+    max_linear_decel:    float = 4.0   # [m/s²] deceleration limit
+    max_angular_accel:   float = 6.0   # [rad/s²] angular accel limit
+    tracking_error:      float = 0.05   # ε [m]
+    orientation_time:    float = 0.50   # T [s]
+    time_horizon:        float = 5.0    # τ [s] collision lookahead
+    neighbor_dist:       float = 5.0    # [m] sensing radius
+    sim_dt:              float = 0.10   # [s] control period
 
     @property
     def inflated_radius(self) -> float:
@@ -175,8 +178,9 @@ class NHKinematicMapper:
                 v = v_opt
                 self._last_region = 'R_A2'
             else:
-                v = 0.0
-                self._last_region = 'R_B'   # ← stop-and-spin: most jitter source
+                # Never stop completely - maintain minimum forward speed while turning
+                v = v_lim_for_omega(omega) * 0.3  # 30% of max possible speed
+                self._last_region = 'R_A2'  # Always stay in tight-turn region
 
         return (float(np.clip(v, 0.0, v_max)),
                 float(np.clip(omega, -w_max, w_max)))

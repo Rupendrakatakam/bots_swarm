@@ -26,8 +26,24 @@ def run_simulation(fleet, agent_data, camera_blobs=None, max_steps=3000, dt=0.1)
         p = ctrl.state.pose
         histories[rid].append((p.x, p.y, p.yaw))
 
+    circle_center = np.array([8.0, 8.0])
+    circle_radius = 4.0
+    blob_period = 400
+    blob_history = []
+
     for step in range(max_steps):
-        commands = fleet.tick_all(camera_blobs=camera_blobs)
+        angle = 2.0 * math.pi * (step % blob_period) / float(blob_period)
+        blob_pos = circle_center + circle_radius * np.array([math.cos(angle), math.sin(angle)])
+        blob_history.append((float(blob_pos[0]), float(blob_pos[1])))
+
+        dynamic_camera_blobs = [CameraBlob(
+            x=float(blob_pos[0]),
+            y=float(blob_pos[1]),
+            radius=1.3,
+            priority=1.5
+        )]
+
+        commands = fleet.tick_all(camera_blobs=dynamic_camera_blobs)
         all_reached = all(fleet.robots[rid].reached_goal for rid in fleet.robots)
 
         for rid, cmd in commands.items():
@@ -51,16 +67,17 @@ def run_simulation(fleet, agent_data, camera_blobs=None, max_steps=3000, dt=0.1)
     for rid, ctrl in fleet.robots.items():
         ctrl.logger.jitter_report()
 
-    return histories
+    return histories, blob_history
 
 
 def build_figure(fleet, agent_data, global_paths, histories,
-                 world_size=20.0, static_circles=None, static_rects=None,
-                 camera_blobs=None):
+                  world_size=20.0, static_circles=None, static_rects=None,
+                  camera_blobs=None, blob_history=None):
 
     static_circles = static_circles or []
     static_rects   = static_rects   or []
     camera_blobs   = camera_blobs   or []
+    blob_history   = blob_history   or []
 
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.set_xlim(0, world_size)
@@ -91,11 +108,15 @@ def build_figure(fleet, agent_data, global_paths, histories,
                                 linewidth=1.2, zorder=2))
 
     # Camera blobs - visualize unknown dynamic obstacles
-    for blob in camera_blobs:
-        ax.add_patch(Circle((blob.x, blob.y), blob.radius,
-                            color='purple', alpha=0.25, zorder=2))
-        ax.text(blob.x, blob.y + blob.radius + 0.2, 'CAM', fontsize=7,
-                ha='center', color='purple')
+    # No trailing path - just show current blob position
+
+    # Dynamic blob patch (will be updated in animation)
+    # Use mutable container for proper closure capture
+    blob_patch_container = [None]
+    if len(blob_history) > 0:
+        bx, by = blob_history[0]
+        blob_patch_container[0] = Circle((bx, by), 1.3, color='darkviolet', alpha=0.7, zorder=4)
+        ax.add_patch(blob_patch_container[0])
 
     # A* paths
     for rid, path in global_paths.items():
@@ -181,7 +202,12 @@ def build_figure(fleet, agent_data, global_paths, histories,
                              right_wheels[rid]])
 
         speed_text.set_text('  '.join(speeds) + ' m/s')
-        return artists
+
+        if blob_patch_container[0] is not None and frame < len(blob_history):
+            bx, by = blob_history[frame]
+            blob_patch_container[0].center = (bx, by)
+
+        return artists + ([blob_patch_container[0]] if blob_patch_container[0] is not None else [])
 
     return fig, update, max(len(h) for h in histories.values())
 
@@ -190,23 +216,25 @@ if __name__ == '__main__':
 
     # ── 1. Config ──────────────────────────────────────────────────────────
     cfg = DiffDriveConfig(
-        robot_radius      = 1.0,
-        wheel_base        = 0.8,
-        max_linear_speed  = 2.0,
-        max_angular_speed = 10.0,   # Increased to allow faster turns, reducing time spent in high heading error
-        max_wheel_speed   = 3.0,    # Increased to support higher linear speeds during turns
-        # KEY TUNING: balance tracking error and orientation time for better speed
-        tracking_error    = 0.40,   # Moderate tracking error tolerance
-        orientation_time  = 0.5,    # Moderate time to turn
-        time_horizon      = 3.0,
-        neighbor_dist     = 6.0,
-        sim_dt            = 0.1,
+        robot_radius        = 1.0,
+        wheel_base          = 0.8,
+        max_linear_speed    = 2.0,
+        max_angular_speed   = 5.0,    # Reduced for more conservative turning
+        max_wheel_speed     = 3.0,
+        max_linear_accel    = 2.0,     # Reduced for smoother acceleration
+        max_linear_decel    = 3.0,     # Reduced for smoother deceleration
+        max_angular_accel   = 4.0,     # Reduced for smoother turns
+        tracking_error      = 0.50,    # Increased for more forgiving turns
+        orientation_time    = 1.2,     # More time for turns = smoother
+        time_horizon        = 3.0,
+        neighbor_dist       = 6.0,
+        sim_dt              = 0.1,
     )
 
     # ── 2. Obstacles ───────────────────────────────────────────────────────
-    # No internal obstacles - straight line A* paths
-    INTERNAL_CIRCLES = []
-    INTERNAL_RECTS   = []
+    # Internal static obstacles for A* path planning AND APF emergency backup
+    INTERNAL_CIRCLES = [CircleObstacle(8.0, 8.0, 1.5)]  # Static pillar near diagonal path
+    INTERNAL_RECTS   = []  # No rect obstacles as requested
 
     # Boundary walls for A*
     BOUNDARY_RECTS = [
@@ -217,20 +245,20 @@ if __name__ == '__main__':
     ]
     ALL_RECTS_FOR_ASTAR = INTERNAL_RECTS + BOUNDARY_RECTS
 
-    # APF: only for dynamic obstacles - no static obstacles
+    # APF: static obstacles for EMERGENCY LOCAL AVOIDANCE (when blob pushes robot toward them)
     apf = APF(
         k_att = 1.9,
         k_rep = 10.0,
-        rho_0 = 1.5,
-        max_force = 7.0,
-        vortex_gain = 0.35,
-        static_circles = [],
-        static_rects = [],
-        enable_static_repulsion = False,  # APF only for dynamic obstacles (camera blobs)
+        rho_0 = 3.0,
+        max_force = 10.0,
+        vortex_gain = 0.3,
+        static_circles = INTERNAL_CIRCLES,
+        static_rects = INTERNAL_RECTS,
+        enable_static_repulsion = True,  # Enable emergency backup for static obstacles
     )
 
     # ── 3. Agent definitions ────────────────────────────────────────────────
-    # Two robots - A will pass near camera blob at (10,5)
+    # Two robots - Robot A will pass near camera blob at (6,6) before static circle at (8,8)
     agent_data = {
         'A': {'start': (2.0, 2.0, math.pi/4),       'goal': (18.0, 18.0), 'color': 'royalblue'},
         'B': {'start': (2.0, 12.0, 0.0),            'goal': (18.0,  2.0), 'color': 'seagreen'},
@@ -280,12 +308,12 @@ if __name__ == '__main__':
             global_paths[rid] = robot.path.waypoints
 
     # ── 5. Camera blobs ─────────────────────────────────────────────────────
-    # Camera blob on Robot A's path for APF visualization
-    camera_blobs = [CameraBlob(x=7.0, y=7.0, radius=1.2, priority=1.5)]
+    # Dynamic blob moves in circular motion around center (8,8) with radius 4
+    camera_blobs = [CameraBlob(x=12.0, y=8.0, radius=1.3, priority=1.5)]  # Starting at right side of circle
 
     # ── 6. Simulate ─────────────────────────────────────────────────────────
     print("Running simulation...")
-    histories = run_simulation(
+    histories, blob_history = run_simulation(
         fleet        = fleet,
         agent_data   = agent_data,
         camera_blobs = camera_blobs,
@@ -303,6 +331,7 @@ if __name__ == '__main__':
         static_circles = INTERNAL_CIRCLES,
         static_rects   = INTERNAL_RECTS,
         camera_blobs   = camera_blobs,
+        blob_history   = blob_history,
     )
 
     ani = animation.FuncAnimation(
