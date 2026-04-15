@@ -379,22 +379,23 @@ class WaypointTracker:
 
     def __init__(
         self,
-        max_speed:        float = 0.26,    # [m/s]
-        lookahead_window: int   = 15,      # how many waypoints to scan ahead
-        carrot_steps:     int   = 3,       # how many steps ahead to target
-        goal_tolerance:   float = 0.15,    # [m] distance to declare "reached"
-        curvature_steps:  int   = 10,      # look ahead N steps for curvature
-        max_curvature:    float = 1.5,     # rad/m threshold to trigger braking
+        max_speed: float = 0.26, # [m/s]
+        lookahead_window: int = 15, # how many waypoints to scan ahead
+        carrot_steps: int = 3, # how many steps ahead to target
+        goal_tolerance: float = 0.15, # [m] distance to declare "reached"
+        curvature_steps: int = 10, # look ahead N steps for curvature
+        max_curvature: float = 1.5, # rad/m threshold to trigger braking
     ):
-        self.max_speed        = max_speed
+        self.max_speed = max_speed
         self.lookahead_window = lookahead_window
-        self.carrot_steps     = carrot_steps
-        self.goal_tolerance   = goal_tolerance
-        self.curvature_steps  = curvature_steps
-        self.max_curvature    = max_curvature
-        self._current_idx     = 0
-        self._prev_v_path     = np.zeros(2)
-        self.path_alpha       = 0.4  # Path velocity smoothing factor
+        self.carrot_steps = carrot_steps
+        self.goal_tolerance = goal_tolerance
+        self.curvature_steps = curvature_steps
+        self.max_curvature = max_curvature
+        self._current_idx = 0
+        self._prev_v_path = np.zeros(2)
+        self.path_alpha = 0.4 # Path velocity smoothing factor
+        self._last_carrot: Optional[np.ndarray] = None # exposed for ImprovedAPF
 
     def reset(self):
         """Call this when a new path is loaded."""
@@ -430,8 +431,9 @@ class WaypointTracker:
         self._current_idx = lo + closest_local
 
         carrot_idx = min(self._current_idx + self.carrot_steps, n_wp - 1)
-        carrot     = wps[carrot_idx]
-        diff       = carrot - robot_pos
+        carrot = wps[carrot_idx]
+        self._last_carrot = carrot.copy()
+        diff = carrot - robot_pos
         dist       = np.linalg.norm(diff)
 
         if dist < 1e-4:
@@ -495,8 +497,9 @@ class IntentionBlender:
     def compute(
         self,
         robot_pos: Tuple[float, float],
-        v_path: np.ndarray,    # from waypoint tracker
-        camera_blobs: List[CameraBlob],    # UNKNOWN obstacles ONLY
+        v_path: np.ndarray, # from waypoint tracker
+        camera_blobs: List[CameraBlob], # UNKNOWN obstacles ONLY
+        goal_pos: Optional[Tuple[float, float]] = None, # carrot waypoint for ImprovedAPF rho_g
     ) -> np.ndarray: # V_pref [vx, vy]
         """
         Blend the path velocity with APF repulsion from camera blobs.
@@ -518,7 +521,9 @@ class IntentionBlender:
 
         # APF returns ONLY the repulsive component
         # (the attractive pull is handled by the waypoint tracker above)
-        F_unknown = self.apf.get_repulsive_only(robot_pos, dyn_obs)
+        # goal_pos enables ImprovedAPF's GNRO fix (rho_g calculation). If None,
+        # ImprovedAPF silently falls back to classical behaviour.
+        F_unknown = self.apf.get_repulsive_only(robot_pos, dyn_obs, goal_pos=goal_pos)
 
         f_mag = np.linalg.norm(F_unknown)
 
@@ -726,9 +731,11 @@ class EmergencyBrake:
     Monitors the robot's immediate neighbourhood every tick and triggers
     three escalating responses when an obstacle is too close.
 
-    LEVEL 1 — SLOW DOWN (warning zone):  distance < warn_dist → scale speed
-    LEVEL 2 — HARD BRAKE (danger zone):   distance < brake_dist → cmd_v = 0
+    LEVEL 1 — SLOW DOWN (warning zone): distance < warn_dist → scale speed
+    LEVEL 2 — HARD BRAKE (danger zone): distance < brake_dist → cmd_v = 0
     LEVEL 3 — REVERSE (collision imminent): distance < reverse_dist → reverse
+
+    Also checks boundary walls (proximity levels same as blob levels).
 
     APF is "soft" physics — it pushes but never guarantees non-overlap.
     This is the hard geometric check that catches what APF misses when
@@ -738,11 +745,15 @@ class EmergencyBrake:
     def __init__(
         self,
         robot_radius: float = 1.0,
-        warn_dist: float = 0.8,    # gap: slow down
-        brake_dist: float = 0.3,   # gap: hard brake
+        warn_dist: float = 0.8, # gap: slow down
+        brake_dist: float = 0.3, # gap: hard brake
         reverse_dist: float = 0.0, # gap: reverse (≤0 = overlapping)
-        slow_factor: float = 0.4,  # fraction of max speed in warning
+        slow_factor: float = 0.4, # fraction of max speed in warning
         reverse_speed: float = 0.3, # [m/s] reverse speed
+        world_x_min: float = 0.0,
+        world_x_max: float = 20.0,
+        world_y_min: float = 0.0,
+        world_y_max: float = 20.0,
     ):
         self.robot_radius = robot_radius
         self.warn_dist = warn_dist
@@ -750,6 +761,10 @@ class EmergencyBrake:
         self.reverse_dist = reverse_dist
         self.slow_factor = slow_factor
         self.reverse_speed = reverse_speed
+        self.world_x_min = world_x_min
+        self.world_x_max = world_x_max
+        self.world_y_min = world_y_min
+        self.world_y_max = world_y_max
 
     def check(
         self,
@@ -759,21 +774,60 @@ class EmergencyBrake:
         camera_blobs: List[CameraBlob],
     ) -> WheelCommand:
         """Inspect cmd against immediate geometry and override if unsafe."""
-        min_gap = float('inf')
-        closest_dir = None
+        # ── Check blob obstacles ──────────────────────────────────────────
+        min_blob_gap = float('inf')
+        closest_blob_dir = None
 
         for blob in camera_blobs:
             blob_pos = np.array([blob.x, blob.y])
             centre_dist = np.linalg.norm(robot_pos - blob_pos)
             gap = centre_dist - blob.radius - self.robot_radius
 
-            if gap < min_gap:
-                min_gap = gap
+            if gap < min_blob_gap:
+                min_blob_gap = gap
                 if centre_dist > 1e-9:
-                    closest_dir = (robot_pos - blob_pos) / centre_dist
+                    closest_blob_dir = (robot_pos - blob_pos) / centre_dist
+
+        # ── Check boundary walls ──────────────────────────────────────────
+        # Find smallest gap to any wall
+        min_wall_gap = float('inf')
+        push_dir = np.zeros(2)  # direction to push away from wall
+
+        x, y = robot_pos[0], robot_pos[1]
+        r = self.robot_radius
+
+        # Left wall
+        gap_left = x - r - self.world_x_min
+        if gap_left < min_wall_gap:
+            min_wall_gap = gap_left
+            push_dir = np.array([1.0, 0.0])
+        # Right wall
+        gap_right = self.world_x_max - r - x
+        if gap_right < min_wall_gap:
+            min_wall_gap = gap_right
+            push_dir = np.array([-1.0, 0.0])
+        # Bottom wall
+        gap_bottom = y - r - self.world_y_min
+        if gap_bottom < min_wall_gap:
+            min_wall_gap = gap_bottom
+            push_dir = np.array([0.0, 1.0])
+        # Top wall
+        gap_top = self.world_y_max - r - y
+        if gap_top < min_wall_gap:
+            min_wall_gap = gap_top
+            push_dir = np.array([0.0, -1.0])
+
+        # Use whichever is worse (smaller gap)
+        min_gap = min(min_blob_gap, min_wall_gap)
+
+        # If only blob triggered, save its direction for Level 3
+        if min_blob_gap <= min_wall_gap and closest_blob_dir is not None:
+            closest_dir = closest_blob_dir
+        else:
+            closest_dir = push_dir
 
         if min_gap == float('inf') or closest_dir is None:
-            return cmd  # no blobs — passthrough
+            return cmd  # no obstacles — passthrough
 
         # ── Level 3: Reverse ──────────────────────────────────────────────
         if min_gap <= self.reverse_dist:
@@ -880,11 +934,15 @@ class RobotController:
         self.mapper = MotorMapper(cfg, filter_alpha=filter_alpha)
         self.emergency = EmergencyBrake(
             robot_radius=cfg.robot_radius,
-            warn_dist=cfg.robot_radius * 0.8,    # 0.8m gap → slow down
-            brake_dist=cfg.robot_radius * 0.3,   # 0.3m gap → hard brake
-            reverse_dist=0.0,                    # overlapping → reverse
+            warn_dist=cfg.robot_radius * 0.8, # 0.8m gap → slow down
+            brake_dist=cfg.robot_radius * 0.3, # 0.3m gap → hard brake
+            reverse_dist=0.0, # overlapping → reverse
             slow_factor=0.35,
             reverse_speed=cfg.max_linear_speed * 0.2,
+            world_x_min=cfg.world_x_min,
+            world_x_max=cfg.world_x_max,
+            world_y_min=cfg.world_y_min,
+            world_y_max=cfg.world_y_max,
         )
 
         # State
@@ -892,11 +950,18 @@ class RobotController:
         self.goal:        Optional[Tuple[float, float]] = None
         self.reached_goal = False
 
-        # Debug/log (last tick values)
-        self._last_v_path    = np.zeros(2)
+# Debug/log (last tick values)
+        self._last_v_path = np.zeros(2)
         self._last_f_unknown = np.zeros(2)
-        self._last_v_pref    = np.zeros(2)
-        self._last_v_safe    = np.zeros(2)
+        self._last_v_pref = np.zeros(2)
+        self._last_v_safe = np.zeros(2)
+
+        # Yield coordination state (set by FleetManager._detect_and_assign_yields)
+        self.yield_priority: int = 0  # 0=normal, higher=has right-of-way
+        self.is_yielding: bool = False  # True = commanded to yield by fleet
+        self._forced_stop: bool = False  # True = fleet commanded hard stop
+        self.path_progress: float = 0.0  # fraction 0..1 of waypoints already passed
+        self._yield_mode: bool = False  # True = soft-yield (creep speed)
 
         self.logger = PipelineLogger(robot_id, print_every=100)
 
@@ -969,11 +1034,21 @@ class RobotController:
             self.reached_goal = True
             return WheelCommand()
 
+        # ── Track path progress (0.0 = start, 1.0 = end) ───────────────────
+        if self.path.is_loaded:
+            wp_idx = self.tracker._current_idx
+            total_wp = len(self.path.waypoints)
+            self.path_progress = float(wp_idx) / max(total_wp - 1, 1)
+        else:
+            self.path_progress = 0.0
+
         # ── Phase 3+4: Shield + Blender → V_pref ─────────────────────────
+        goal_pos = tuple(self.tracker._last_carrot) if hasattr(self.tracker, '_last_carrot') and self.tracker._last_carrot is not None else None
         v_pref = self.blender.compute(
-            robot_pos    = tuple(pos),
-            v_path       = v_path,
-            camera_blobs = camera_blobs,     # ONLY unknown obstacles
+            robot_pos = tuple(pos),
+            v_path = v_path,
+            camera_blobs = camera_blobs, # ONLY unknown obstacles
+            goal_pos = goal_pos, # carrot → ImprovedAPF rho_g (Eq.1-3)
         )
 
         # ── Phase 5: NH-ORCA → V_safe ─────────────────────────────────────
@@ -1021,8 +1096,8 @@ class RobotController:
             n_camera_blobs = len(camera_blobs),
             orca_planner   = self.orca,
             mapper         = self.mapper,
-            cmd            = cmd,
-yaw = yaw,
+             cmd            = cmd,
+             yaw=yaw,
         )
 
         # ── Emergency brake override (last safety net before hardware) ────
@@ -1034,6 +1109,21 @@ yaw = yaw,
             robot_yaw=yaw,
             camera_blobs=camera_blobs,
         )
+
+        # ── Fleet-level yield/stop override ──────────────────────────────
+        if self._forced_stop:
+            return WheelCommand(v=0.0, omega=0.0, vl=0.0, vr=0.0)
+
+        if self.is_yielding:
+            # Yielding: reduce speed to near-zero to allow passing
+            # We do this by scaling down the velocity command
+            yield_scale = 0.05  # 5% of normal speed = creep
+            return WheelCommand(
+                v=cmd.v * yield_scale,
+                omega=cmd.omega * yield_scale,
+                vl=cmd.vl * yield_scale,
+                vr=cmd.vr * yield_scale,
+            )
 
         return cmd
 
@@ -1113,20 +1203,23 @@ class FleetManager:
 
     def tick_all(
         self,
-        camera_blobs: List[CameraBlob] = None,   # shared across all robots
+        camera_blobs: List[CameraBlob] = None, # shared across all robots
     ) -> Dict[str, WheelCommand]:
         """
         Run one full tick for ALL robots.
 
         Each robot gets:
-            camera_blobs     → the shared list of unknown obstacles (APF)
-            swarm_telemetry  → telemetry of all OTHER robots (NH-ORCA)
+        camera_blobs → the shared list of unknown obstacles (APF)
+        swarm_telemetry → telemetry of all OTHER robots (NH-ORCA)
 
         Returns
         -------
         Dict mapping robot_id → WheelCommand
         """
         camera_blobs = camera_blobs or []
+
+        # ── PHASE 0: Conflict detection + yield assignment ──────────────
+        self._detect_and_assign_yields()
 
         # Build telemetry snapshot for this tick
         # (all robots broadcast their current state)
@@ -1160,6 +1253,78 @@ class FleetManager:
             )
 
         return commands
+
+    def _detect_and_assign_yields(self):
+        """
+        Predict trajectory conflicts between robots using motion prediction.
+        The lower path_progress robot (less committed to its path) yields,
+        allowing the higher-progress robot to continue without conflict.
+
+        Algorithm (per robot pair):
+        1. Project both robots' positions forward using current velocity + time_horizon
+        2. Solve quadratic: ||pos_a + t*vel_a - (pos_b + t*vel_b)|| = conflict_dist
+        3. If a solution exists for t in (0, tau] → trajectories intersect within horizon
+        4. Lower path_progress robot yields (more flexibility to stop/replan)
+        """
+        for ctrl in self.robots.values():
+            ctrl.is_yielding = False
+            ctrl._forced_stop = False
+
+        robot_ids = list(self.robots.keys())
+        tau = self.cfg.time_horizon
+        combined_radius = self.cfg.inflated_radius * 2.0
+        conflict_buffer = 1.0
+        conflict_dist = combined_radius + conflict_buffer
+
+        for i, rid_a in enumerate(robot_ids):
+            for rid_b in robot_ids[i + 1:]:
+                ctrl_a = self.robots[rid_a]
+                ctrl_b = self.robots[rid_b]
+
+                pos_a = np.array([ctrl_a.state.pose.x, ctrl_a.state.pose.y])
+                pos_b = np.array([ctrl_b.state.pose.x, ctrl_b.state.pose.y])
+                vel_a = ctrl_a.state.vel
+                vel_b = ctrl_b.state.vel
+
+                # Relative motion: when will distance between them be < conflict_dist?
+                # Solve: ||pos_a + t*vel_a - (pos_b + t*vel_b)||^2 = conflict_dist^2
+                rel_pos = pos_b - pos_a
+                rel_vel = vel_a - vel_b  # velocity of A relative to B
+
+                a_coef = float(np.dot(rel_vel, rel_vel))
+                b_coef = 2.0 * float(np.dot(rel_pos, rel_vel))
+                c_coef = float(np.dot(rel_pos, rel_pos)) - conflict_dist ** 2
+
+                will_conflict = False
+                time_to_conflict = float('inf')
+
+                if a_coef < 1e-9:
+                    # Nearly parallel motion — check if current distance is already < conflict_dist
+                    if c_coef < 0:
+                        will_conflict = True
+                        time_to_conflict = 0.0
+                else:
+                    discriminant = b_coef ** 2 - 4.0 * a_coef * c_coef
+                    if discriminant >= 0:
+                        sqrt_disc = math.sqrt(discriminant)
+                        t1 = (-b_coef - sqrt_disc) / (2.0 * a_coef)
+                        t2 = (-b_coef + sqrt_disc) / (2.0 * a_coef)
+                        # Check both roots — conflict occurs when robot pair enters conflict zone
+                        for t in (t1, t2):
+                            if 0.0 < t <= tau:
+                                will_conflict = True
+                                if t < time_to_conflict:
+                                    time_to_conflict = t
+                                break
+
+                if will_conflict:
+                    # Lower path_progress yields (less committed to path = easier to stop)
+                    if ctrl_a.path_progress < ctrl_b.path_progress:
+                        ctrl_a.is_yielding = True
+                        ctrl_a._forced_stop = True
+                    else:
+                        ctrl_b.is_yielding = True
+                        ctrl_b._forced_stop = True
 
     def get_fleet_debug(self) -> List[Dict]:
         """Return debug info for all robots (for logging / visualisation)."""
@@ -1286,12 +1451,27 @@ def build_figure(
         x0, y0, x1, y1 = obs.bounds
         from matplotlib.patches import Rectangle
         ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0,
-                                fill=True, color='red', alpha=0.35, zorder=2))
+                     fill=True, color='red', alpha=0.35, zorder=2))
         ax.add_patch(Rectangle((x0 - INFLATE, y0 - INFLATE),
-                                (x1 - x0) + 2 * INFLATE,
-                                (y1 - y0) + 2 * INFLATE,
-                                fill=False, color='orange', linestyle='--',
-                                linewidth=1.2, zorder=2))
+                     (x1 - x0) + 2 * INFLATE, (y1 - y0) + 2 * INFLATE,
+                     fill=False, color='orange', linestyle='--',
+                     linewidth=1.2, zorder=2))
+
+    # ── Boundary walls ─────────────────────────────────────────────────
+    # Four walls around the world perimeter — dark gray, solid
+    from matplotlib.patches import Rectangle as Rect2D
+    wall_color = 'dimgray'
+    wall_color = 'dimgray'
+    wall_alpha = 0.6
+    W = 0.15  # wall thickness [m]
+    ax.add_patch(Rect2D((0, 0), W, world_size,
+                 fill=True, color=wall_color, alpha=wall_alpha, zorder=1))
+    ax.add_patch(Rect2D((world_size - W, 0), W, world_size,
+                 fill=True, color=wall_color, alpha=wall_alpha, zorder=1))
+    ax.add_patch(Rect2D((0, 0), world_size, W,
+                 fill=True, color=wall_color, alpha=wall_alpha, zorder=1))
+    ax.add_patch(Rect2D((0, world_size - W), world_size, W,
+                 fill=True, color=wall_color, alpha=wall_alpha, zorder=1))
 
     # ── Global path lines (dashed) ────────────────────────────────────────
     for rid, path in global_paths.items():

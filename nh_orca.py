@@ -77,9 +77,15 @@ class DiffDriveConfig:
     max_angular_accel:   float = 6.0   # [rad/s²] angular accel limit
     tracking_error:      float = 0.05   # ε [m]
     orientation_time:    float = 0.50   # T [s]
-    time_horizon:        float = 5.0    # τ [s] collision lookahead
-    neighbor_dist:       float = 5.0    # [m] sensing radius
-    sim_dt:              float = 0.10   # [s] control period
+    time_horizon: float = 5.0 # τ [s] collision lookahead
+    neighbor_dist: float = 5.0 # [m] sensing radius
+    sim_dt: float = 0.10 # [s] control period
+    # Boundary world dimensions [m] — used by ORCA for wall constraints
+    world_x_min: float = 0.0
+    world_x_max: float = 20.0
+    world_y_min: float = 0.0
+    world_y_max: float = 20.0
+    boundary_buffer: float = 0.5 # minimum gap from wall [m]
 
     @property
     def inflated_radius(self) -> float:
@@ -459,7 +465,7 @@ class NHORCAPlanner:
         # NOTE: Removed pre-clip to P_AHV - it was incorrectly crushing velocity to near-zero
         # The ORCA LP will find a valid velocity; P_AHV is just for post-clip safety check
 
-        # ── Step 2: Build ORCA half-planes (swarm only) ───────────────────────
+# ── Step 2: Build ORCA half-planes (swarm only) ───────────────────────
         halfplanes: List[HalfPlane] = []
         for nb in neighbors:
             if np.linalg.norm(nb.pos - ego.pos) > cfg.neighbor_dist:
@@ -467,6 +473,40 @@ class NHORCAPlanner:
             hp = compute_orca_halfplane(ego, nb, cfg.time_horizon, c=0.5)
             if hp is not None:
                 halfplanes.append(hp)
+
+        # ── Boundary wall constraints ─────────────────────────────────────
+        # Each wall adds a half-plane when robot is within PROX metres of it.
+        # The half-plane pushes velocity toward the safe side (inside the map).
+        x_min = cfg.world_x_min + cfg.boundary_buffer
+        x_max = cfg.world_x_max - cfg.boundary_buffer
+        y_min = cfg.world_y_min + cfg.boundary_buffer
+        y_max = cfg.world_y_max - cfg.boundary_buffer
+        PROX = 0.5  # [m] — only activate constraint when this close to wall
+
+        # Left wall: normal points RIGHT (safe side is to the right / inside)
+        if ego.pos[0] < x_min + PROX:
+            n = np.array([1.0, 0.0])
+            # point = velocity needed to maintain x >= x_min within time_horizon
+            point = np.array([(x_min - ego.pos[0]) / cfg.time_horizon, 0.0])
+            halfplanes.append(HalfPlane(point=point, normal=n))
+
+        # Right wall: normal points LEFT (safe side is to the left / inside)
+        if ego.pos[0] > x_max - PROX:
+            n = np.array([-1.0, 0.0])
+            point = np.array([(x_max - ego.pos[0]) / cfg.time_horizon, 0.0])
+            halfplanes.append(HalfPlane(point=point, normal=n))
+
+        # Bottom wall: normal points UP (safe side is upward / inside)
+        if ego.pos[1] < y_min + PROX:
+            n = np.array([0.0, 1.0])
+            point = np.array([0.0, (y_min - ego.pos[1]) / cfg.time_horizon])
+            halfplanes.append(HalfPlane(point=point, normal=n))
+
+        # Top wall: normal points DOWN (safe side is downward / inside)
+        if ego.pos[1] > y_max - PROX:
+            n = np.array([0.0, -1.0])
+            point = np.array([0.0, (y_max - ego.pos[1]) / cfg.time_horizon])
+            halfplanes.append(HalfPlane(point=point, normal=n))
 
         # ── Step 3: LP — half-planes + speed disc only (NO P_AHV) ────────────
         # P_AHV is NOT a hard LP constraint.

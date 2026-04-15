@@ -277,6 +277,8 @@ class APF:
         self,
         robot_pos: Tuple[float, float],
         dynamic_obstacles: Optional[List[DynamicObstacle]] = None,
+        goal_pos: Optional[Tuple[float, float]] = None, # for ImprovedAPF compatibility
+        robot_id: str = 'default', # for ImprovedAPF per-robot state
     ) -> np.ndarray:
         """
         Return ONLY the repulsive component F_unknown (no attraction).
@@ -286,6 +288,9 @@ class APF:
 
         See architecture doc:
         V_pref = V_path (from waypoint tracker) + F_unknown (from here)
+
+        goal_pos and robot_id are accepted for API compatibility with ImprovedAPF.
+        ClassicalAPF ignores them (no GNRO fix, no local minima escape).
         """
         q = np.array(robot_pos, dtype=float)
         F_rep = np.zeros(2)
