@@ -5,6 +5,21 @@ F_att = -k_att * (q - goal)
 F_rep = k_rep * (1/rho - 1/rho_0) * (1/rho^2) * (grad(rho))
 F_total = F_att + F_rep
 
+adaptive repulsion :
+U_rep = 1/2 * eta *((1/(rho(x,x_obs)) - 1/rho)) * rho^n (x,x_obs) , where rho(x,x_obs) <= rho_0
+else 0 , rho(x,x_obs) > rho_0
+where eta = repulsion gain
+n = regulation const
+rho(x,x_obs) = distance between robot and obstacle
+
+F_rep = -grad(U_rep)
+
+grad(U_rep) = -(F_rep1 + F_rep2) , where rho(x,x_obs) <= rho_0
+else 0 , rho(x,x_obs) > rho_0
+
+where F_rep1 = eta * (1/rho(x,x_obs) - 1/rho_0) * (rho^n(x,x_goal)/rho(x,x_i)^2) * (grad(rho(x,x_obs)))
+
+
 Role in pipeline: Phase 3 "The Shield"
  
 PURPOSE
@@ -191,6 +206,7 @@ class APF:
         rho_0: float = 1.5,
         max_force: float = 5.0,
         vortex_gain: float = 0.4,
+        robot_radius: float = 1.0,  # NEW: robot's own physical radius
         static_circles: Optional[List[CircleObstacle]] = None,
         static_rects: Optional[List[RectObstacle]] = None,
         enable_static_repulsion: bool = True,
@@ -200,6 +216,7 @@ class APF:
         self.rho_0 = rho_0
         self.max_force = max_force
         self.vortex_gain = vortex_gain
+        self.robot_radius = robot_radius  # NEW
 
         # Static obstacles (set once at startup from the map)
         self.static_circles = static_circles or []
@@ -302,13 +319,8 @@ class APF:
         """
         Repulsion from static map obstacles (walls, pillars).
 
-        Formula (standard APF):
-            magnitude = k_rep * (1/ρ - 1/ρ₀) * (1/ρ²)
-            direction = unit vector from obstacle surface toward robot
-
-        WHERE
-            ρ   = distance from robot to obstacle surface
-            ρ₀  = influence radius (obstacles outside are ignored)
+        ρ = distance from robot SURFACE to obstacle SURFACE.
+        Both robot_radius and obstacle geometry are accounted for.
         """
         F_rep = np.zeros(2)
 
@@ -320,69 +332,70 @@ class APF:
             surface_points.append(obs.closest_point(q))
 
         for pt in surface_points:
-            rho = np.linalg.norm(q - pt)
-            rho = max(rho, 0.01)          # floor to avoid division by zero
+            centre_dist = np.linalg.norm(q - pt)
+            # Gap between robot surface and obstacle surface
+            rho = centre_dist - self.robot_radius
+            rho = max(rho, 0.01)  # floor to avoid division by zero
             if rho < self.rho_0:
-                mag  = self.k_rep * (1.0 / rho - 1.0 / self.rho_0) / (rho ** 2)
-                dirn = (q - pt) / rho
+                mag = self.k_rep * (1.0 / rho - 1.0 / self.rho_0) / (rho ** 2)
+                dirn = (q - pt) / max(centre_dist, 1e-9)
                 F_rep += mag * dirn
 
         return F_rep
 
     def _repulsive_dynamic(
-        self, q: np.ndarray, obstacles: List[DynamicObstacle]
-    ) -> np.ndarray:
+        self,
+        q: np.ndarray,
+        obstacles: List[DynamicObstacle]
+        ) -> np.ndarray:
         """
-        Repulsion from UNKNOWN dynamic obstacles (camera blobs).
+        Repulsion from unknown camera blobs.
 
-        KEY DIFFERENCES from static repulsion
-        ---------------------------------------
-        1. Distance is measured to the SURFACE of the obstacle (ρ = dist - r_obs)
-           so the force accounts for the object's physical size.
+        CRITICAL FIX: rho = dist_between_centres - blob_radius - robot_radius
+        This is the TRUE gap between physical surfaces.
+        Previously it was dist - blob_radius only, ignoring the robot's own body.
 
-        2. A VORTEX component is added tangentially.
-           WHY: If a robot and a dynamic obstacle are heading exactly
-           toward each other head-on, the repulsive forces are perfectly
-           symmetric and cancel out → deadlock / collision.
-           Adding a small tangential "spin" breaks this symmetry,
-           causing the robot to curve around the obstacle.
-
-        3. A PRIORITY MULTIPLIER scales the force per obstacle.
-           Larger or faster-looking objects can be assigned priority > 1.0
-           to trigger stronger avoidance without changing the global gain.
+        EMERGENCY ZONE: when rho ≤ 0, robots are physically overlapping.
+        A strong constant push-out force is applied, bypassing the normal
+        formula (which would divide by zero or produce garbage at rho ≤ 0).
         """
         F_rep = np.zeros(2)
 
         for obs in obstacles:
             diff = q - obs.pos
-            dist = np.linalg.norm(diff)
+            centre_dist = np.linalg.norm(diff)
 
-            # Distance to obstacle SURFACE (not centre)
-            rho = dist - obs.radius
-            rho = max(rho, 0.05)          # min 5 cm — safety floor
+            # Physical gap between robot edge and obstacle edge
+            rho = centre_dist - obs.radius - self.robot_radius
 
+            # ── EMERGENCY: already overlapping ───────────────────────────
+            if rho <= 0.0:
+                if centre_dist < 1e-9:
+                    push_dir = np.array([1.0, 0.0])
+                else:
+                    push_dir = diff / centre_dist
+                # Emergency force: proportional to penetration depth
+                penetration = abs(rho) + 0.1  # how deep inside [m]
+                emergency_mag = self.max_force * (1.0 + penetration * 2.0)
+                # Add tangential component to slide out, not just push back
+                tangent = np.array([-push_dir[1], push_dir[0]])
+                F_rep += emergency_mag * push_dir + (emergency_mag * 0.5) * tangent
+                continue
+
+            # ── Floor and influence check ─────────────────────────────────
+            rho = max(rho, 0.02)
             if rho >= self.rho_0:
-                continue                  # outside influence radius, skip
+                continue
 
-            # ── Radial repulsion ─────────────────────────────────────────
+            # ── Normal repulsion ──────────────────────────────────────────
             k_eff = self.k_rep * obs.priority
-            mag   = k_eff * (1.0 / rho - 1.0 / self.rho_0) / (rho ** 2)
+            mag = k_eff * (1.0 / rho - 1.0 / self.rho_0) / (rho ** 2)
 
-            # Direction: from obstacle centre toward robot
-            if dist < 1e-9:
-                radial_dir = np.array([1.0, 0.0])     # fallback if exactly overlapping
-            else:
-                radial_dir = diff / dist
-
+            radial_dir = diff / centre_dist
             F_radial = mag * radial_dir
 
-            # ── Vortex (tangential) force ─────────────────────────────────
-            # Rotate radial direction 90° counter-clockwise
-            # This causes the robot to curve LEFT around the obstacle.
-            # (Consistent direction prevents robot from "changing its mind"
-            #  and oscillating left-right.)
-            tangent   = np.array([-radial_dir[1], radial_dir[0]])
-            F_vortex  = (mag * self.vortex_gain) * tangent
+            tangent = np.array([-radial_dir[1], radial_dir[0]])
+            F_vortex = (mag * self.vortex_gain) * tangent
 
             F_rep += F_radial + F_vortex
 
@@ -395,7 +408,11 @@ class APF:
         self.static_circles.append(CircleObstacle(cx, cy, radius))
 
     def add_static_rect(
-        self, x_min: float, y_min: float, x_max: float, y_max: float
+        self,
+        x_min: float,
+        y_min: float,
+        x_max: float,
+        y_max: float
     ):
         """Add a rectangular static obstacle (e.g., wall segment)."""
         self.static_rects.append(RectObstacle(x_min, y_min, x_max, y_max))

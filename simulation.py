@@ -248,10 +248,11 @@ if __name__ == '__main__':
     # APF: static obstacles for EMERGENCY LOCAL AVOIDANCE (when blob pushes robot toward them)
     apf = APF(
         k_att = 1.9,
-        k_rep = 10.0,
-        rho_0 = 3.0,
-        max_force = 10.0,
+        k_rep = 12.0,          # slightly higher — now safe because rho is correct
+        rho_0 = 2.5,           # reduced from 3.0 — now surface-to-surface, not centre
+        max_force = 12.0,
         vortex_gain = 0.3,
+        robot_radius = cfg.robot_radius,  # KEY FIX: pass robot size to APF
         static_circles = INTERNAL_CIRCLES,
         static_rects = INTERNAL_RECTS,
         enable_static_repulsion = True,  # Enable emergency backup for static obstacles

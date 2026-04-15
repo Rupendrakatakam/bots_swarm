@@ -494,19 +494,22 @@ class IntentionBlender:
 
     def compute(
         self,
-        robot_pos:   Tuple[float, float],
-        v_path:      np.ndarray,           # from waypoint tracker
+        robot_pos: Tuple[float, float],
+        v_path: np.ndarray,    # from waypoint tracker
         camera_blobs: List[CameraBlob],    # UNKNOWN obstacles ONLY
-    ) -> np.ndarray:                       # V_pref [vx, vy]
+    ) -> np.ndarray: # V_pref [vx, vy]
         """
         Blend the path velocity with APF repulsion from camera blobs.
 
-        Example
-        -------
-        V_path = [0.2, 0.0]  (robot wants to go east)
-        F_unknown = [0.0, 0.1]  (unknown obstacle to the south, pushing north)
-        → V_pref = [0.2, 0.1]  (robot curves slightly north-east)
+        EMERGENCY: if repulsion magnitude > 2x max_pref_speed, ignore path
+        and output pure repulsion direction to prevent collision.
         """
+        if not camera_blobs:
+            spd = np.linalg.norm(v_path)
+            if spd > self.max_pref_speed:
+                return v_path * (self.max_pref_speed / spd)
+            return v_path.copy()
+
         # Build DynamicObstacle list from camera blobs
         dyn_obs = [
             DynamicObstacle(b.x, b.y, b.radius, b.priority)
@@ -517,6 +520,18 @@ class IntentionBlender:
         # (the attractive pull is handled by the waypoint tracker above)
         F_unknown = self.apf.get_repulsive_only(robot_pos, dyn_obs)
 
+        f_mag = np.linalg.norm(F_unknown)
+
+        # ── Emergency: repulsion very strong — ignore path ────────────────
+        # Do NOT let path attraction cancel emergency repulsion.
+        # If repulsion magnitude > emergency threshold, ignore path and
+        # output pure repulsion at max speed.
+        EMERGENCY_THRESHOLD = self.max_pref_speed * 2.0  # > 1x max_speed = emergency
+        if f_mag > EMERGENCY_THRESHOLD:
+            repulsion_dir = F_unknown / f_mag
+            return repulsion_dir * self.max_pref_speed
+
+        # ── Normal blend: path + repulsion ────────────────────────────────
         V_pref = v_path + F_unknown
 
         # Clip to max preferred speed
@@ -569,47 +584,99 @@ class MotorMapper:
 
     def compute(
         self,
-        vx:       float,
-        vy:       float,
-        yaw:      float,
-        state:    RobotState,
+        vx: float,
+        vy: float,
+        yaw: float,
+        state: RobotState,
     ) -> WheelCommand:
         """
         Convert V_safe = (vx, vy) to a smoothed WheelCommand.
 
         Uses:
+        - Soft-stop deceleration (not abrupt snap to zero)
+        - Heading error EMA smoothing
         - Acceleration limits for smooth speed transitions
         - Coupled speed/steering: slow down when turning
         """
         cfg = self.cfg
-
-        V_H = math.hypot(vx, vy)
-        if V_H < 1e-4:
-            cmd = WheelCommand(0.0, 0.0, 0.0, 0.0)
-            self._prev_v_raw = 0.0
-            self._prev_w_raw = 0.0
-            return cmd
-
-        theta_H   = math.atan2(vy, vx)
-        theta_err_raw = _wrap_angle(theta_H - yaw)
-        
-        # Smooth heading error with EMA
-        theta_err = self.heading_alpha * theta_err_raw + (1 - self.heading_alpha) * self._prev_heading_error
-        self._prev_heading_error = theta_err
-
-        omega_raw = theta_err / cfg.orientation_time
-        omega_raw = float(np.clip(omega_raw, -cfg.max_angular_speed, cfg.max_angular_speed))
-
-        v_raw = _optimal_v(V_H, theta_err)
-        v_raw = float(np.clip(v_raw, 0.0, cfg.max_linear_speed))
-
         dt = cfg.sim_dt
 
-        v_accel_limited = self._prev_v_raw + np.clip(
-            v_raw - self._prev_v_raw,
-            -cfg.max_linear_decel * dt,
-            cfg.max_linear_accel * dt
+        V_H = math.hypot(vx, vy)
+
+        # ── Stop command: decelerate smoothly, don't snap ────────────────
+        if V_H < 1e-4:
+            v_stop = max(0.0, state.prev_v - cfg.max_linear_decel * dt)
+            w_stop = 0.0
+            if abs(state.prev_w) > 1e-4:
+                w_stop = math.copysign(
+                    max(0.0, abs(state.prev_w) - cfg.max_angular_accel * dt),
+                    state.prev_w
+                )
+            state.prev_v = v_stop
+            state.prev_w = w_stop
+            vl, vr = unicycle_to_wheels(v_stop, w_stop, cfg.wheel_base, cfg.max_wheel_speed)
+            v_act, w_act = wheels_to_unicycle(vl, vr, cfg.wheel_base)
+            return WheelCommand(v=v_act, omega=w_act, vl=vl, vr=vr)
+
+        theta_H = math.atan2(vy, vx)
+        theta_err_raw = _wrap_angle(theta_H - yaw)
+
+        # Smooth heading error with EMA
+        theta_err = (self.heading_alpha * theta_err_raw +
+                     (1.0 - self.heading_alpha) * self._prev_heading_error)
+        self._prev_heading_error = theta_err
+
+        omega_target = float(np.clip(
+            theta_err / cfg.orientation_time,
+            -cfg.max_angular_speed,
+            cfg.max_angular_speed
+        ))
+
+        # ── Paper Eq.(8): optimal forward speed for this heading error ────
+        v_target = float(np.clip(
+            _optimal_v(V_H, theta_err),
+            0.0,
+            cfg.max_linear_speed
+        ))
+
+        # ── Coupling: large turn rate forces reduced forward speed ────────
+        # Physical constraint: vr = v + ω*L/2 ≤ max_wheel_speed
+        v_coupled_limit = max(
+            0.0,
+            cfg.max_wheel_speed - abs(omega_target) * cfg.wheel_base / 2.0
         )
+        v_target = min(v_target, v_coupled_limit)
+
+        # ── Acceleration limits (smooth transitions) ──────────────────────
+        dv = v_target - state.prev_v
+        if dv >= 0:
+            dv_limited = min(dv, cfg.max_linear_accel * dt)
+        else:
+            dv_limited = max(dv, -cfg.max_linear_decel * dt)
+        v_filt = float(np.clip(state.prev_v + dv_limited, 0.0, cfg.max_linear_speed))
+
+        dw = omega_target - state.prev_w
+        dw_limited = float(np.clip(
+            dw,
+            -cfg.max_angular_accel * dt,
+            cfg.max_angular_accel * dt
+        ))
+        omega_filt = float(np.clip(
+            state.prev_w + dw_limited,
+            -cfg.max_angular_speed,
+            cfg.max_angular_speed
+        ))
+
+        state.prev_v = v_filt
+        state.prev_w = omega_filt
+
+        # ── Wheel speeds → reconstruct actual v, ω ────────────────────────
+        vl, vr = unicycle_to_wheels(
+            v_filt, omega_filt, cfg.wheel_base, cfg.max_wheel_speed
+        )
+        v_act, w_act = wheels_to_unicycle(vl, vr, cfg.wheel_base)
+
+        return WheelCommand(v=v_act, omega=w_act, vl=vl, vr=vr)
         v_accel_limited = float(np.clip(v_accel_limited, 0.0, cfg.max_linear_speed))
 
         w_accel_limited = self._prev_w_raw + np.clip(
@@ -648,6 +715,103 @@ class MotorMapper:
             vl    = vl,
             vr    = vr
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMERGENCY BRAKE — hard geometric safety net
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EmergencyBrake:
+    """
+    Monitors the robot's immediate neighbourhood every tick and triggers
+    three escalating responses when an obstacle is too close.
+
+    LEVEL 1 — SLOW DOWN (warning zone):  distance < warn_dist → scale speed
+    LEVEL 2 — HARD BRAKE (danger zone):   distance < brake_dist → cmd_v = 0
+    LEVEL 3 — REVERSE (collision imminent): distance < reverse_dist → reverse
+
+    APF is "soft" physics — it pushes but never guarantees non-overlap.
+    This is the hard geometric check that catches what APF misses when
+    the blob moves faster than the robot can react.
+    """
+
+    def __init__(
+        self,
+        robot_radius: float = 1.0,
+        warn_dist: float = 0.8,    # gap: slow down
+        brake_dist: float = 0.3,   # gap: hard brake
+        reverse_dist: float = 0.0, # gap: reverse (≤0 = overlapping)
+        slow_factor: float = 0.4,  # fraction of max speed in warning
+        reverse_speed: float = 0.3, # [m/s] reverse speed
+    ):
+        self.robot_radius = robot_radius
+        self.warn_dist = warn_dist
+        self.brake_dist = brake_dist
+        self.reverse_dist = reverse_dist
+        self.slow_factor = slow_factor
+        self.reverse_speed = reverse_speed
+
+    def check(
+        self,
+        cmd: WheelCommand,
+        robot_pos: np.ndarray,
+        robot_yaw: float,
+        camera_blobs: List[CameraBlob],
+    ) -> WheelCommand:
+        """Inspect cmd against immediate geometry and override if unsafe."""
+        min_gap = float('inf')
+        closest_dir = None
+
+        for blob in camera_blobs:
+            blob_pos = np.array([blob.x, blob.y])
+            centre_dist = np.linalg.norm(robot_pos - blob_pos)
+            gap = centre_dist - blob.radius - self.robot_radius
+
+            if gap < min_gap:
+                min_gap = gap
+                if centre_dist > 1e-9:
+                    closest_dir = (robot_pos - blob_pos) / centre_dist
+
+        if min_gap == float('inf') or closest_dir is None:
+            return cmd  # no blobs — passthrough
+
+        # ── Level 3: Reverse ──────────────────────────────────────────────
+        if min_gap <= self.reverse_dist:
+            heading_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)])
+            into_obs = float(np.dot(heading_vec, -closest_dir))  # > 0 = toward obs
+            if into_obs > 0.1:
+                vl = -self.reverse_speed
+                vr = -self.reverse_speed
+                return WheelCommand(
+                    v=-self.reverse_speed,
+                    omega=cmd.omega * 0.5,
+                    vl=vl,
+                    vr=vr,
+                )
+
+        # ── Level 2: Hard brake ───────────────────────────────────────────
+        if min_gap <= self.brake_dist:
+            return WheelCommand(
+                v=0.0,
+                omega=cmd.omega * 0.8,
+                vl=-cmd.omega * 0.4,
+                vr=cmd.omega * 0.4,
+            )
+
+        # ── Level 1: Slow down ────────────────────────────────────────────
+        if min_gap <= self.warn_dist:
+            scale = max(
+                self.slow_factor,
+                (min_gap - self.brake_dist) / (self.warn_dist - self.brake_dist),
+            )
+            return WheelCommand(
+                v=cmd.v * scale,
+                omega=cmd.omega,
+                vl=cmd.vl * scale,
+                vr=cmd.vr * scale,
+            )
+
+        return cmd  # all clear
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -711,9 +875,17 @@ class RobotController:
             carrot_steps     = carrot_steps,
             goal_tolerance   = goal_tolerance,
         )
-        self.blender  = IntentionBlender(apf, max_pref_speed=cfg.max_linear_speed)
-        self.orca     = NHORCAPlanner(cfg)
-        self.mapper   = MotorMapper(cfg, filter_alpha=filter_alpha)
+        self.blender = IntentionBlender(apf, max_pref_speed=cfg.max_linear_speed)
+        self.orca = NHORCAPlanner(cfg)
+        self.mapper = MotorMapper(cfg, filter_alpha=filter_alpha)
+        self.emergency = EmergencyBrake(
+            robot_radius=cfg.robot_radius,
+            warn_dist=cfg.robot_radius * 0.8,    # 0.8m gap → slow down
+            brake_dist=cfg.robot_radius * 0.3,   # 0.3m gap → hard brake
+            reverse_dist=0.0,                    # overlapping → reverse
+            slow_factor=0.35,
+            reverse_speed=cfg.max_linear_speed * 0.2,
+        )
 
         # State
         self.state        = RobotState()
@@ -850,7 +1022,17 @@ class RobotController:
             orca_planner   = self.orca,
             mapper         = self.mapper,
             cmd            = cmd,
-            yaw            = yaw,
+yaw = yaw,
+        )
+
+        # ── Emergency brake override (last safety net before hardware) ────
+        # Runs AFTER the full pipeline. Catches what APF and ORCA missed.
+        # This is the geometric hard-check that Gazebo physics requires.
+        cmd = self.emergency.check(
+            cmd=cmd,
+            robot_pos=pos,
+            robot_yaw=yaw,
+            camera_blobs=camera_blobs,
         )
 
         return cmd
