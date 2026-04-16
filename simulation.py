@@ -10,7 +10,7 @@ import matplotlib.animation as animation
 from matplotlib.patches import Circle, Rectangle
 
 from hybrid_astar import HybridAStar
-from apf import APF, CircleObstacle, RectObstacle, DynamicObstacle
+from apf import ImprovedAPF, ImprovedAPFParams, CircleObstacle, RectObstacle, DynamicObstacle
 from apf_orca import (
     FleetManager, DiffDriveConfig, CameraBlob,
     RobotController, WheelCommand
@@ -245,17 +245,28 @@ if __name__ == '__main__':
     ]
     ALL_RECTS_FOR_ASTAR = INTERNAL_RECTS + BOUNDARY_RECTS
 
-    # APF: static obstacles for EMERGENCY LOCAL AVOIDANCE (when blob pushes robot toward them)
-    apf = APF(
-        k_att = 1.9,
-        k_rep = 12.0,          # slightly higher — now safe because rho is correct
-        rho_0 = 2.5,           # reduced from 3.0 — now surface-to-surface, not centre
-        max_force = 12.0,
-        vortex_gain = 0.3,
-        robot_radius = cfg.robot_radius,  # KEY FIX: pass robot size to APF
-        static_circles = INTERNAL_CIRCLES,
-        static_rects = INTERNAL_RECTS,
-        enable_static_repulsion = True,  # Enable emergency backup for static obstacles
+# APF: static obstacles for EMERGENCY LOCAL AVOIDANCE (when blob pushes robot toward them)
+# Using ImprovedAPF with GNRO fix (Eq.1-3) + LocalMinimaState (Eq.4-6)
+    p = ImprovedAPFParams(
+        k_att=1.9,
+        eta=12.0,  # repulsion gain (η in paper)
+        rho_0=2.5,
+        max_force=12.0,
+        vortex_gain=0.3,
+        robot_radius=cfg.robot_radius,
+        n_reg=0.5,  # regulation constant n (0 < n < 1)
+        step_length=0.2,  # normal step size l (Eq.4)
+        beta_stuck=3.0,  # stuck threshold β (Eq.4)
+        stuck_window=8,  # consecutive slow steps = stuck
+        beta1=2.0,  # virtual target x-amplitude β₁ (Eq.5)
+        beta2=2.0,  # virtual target y-amplitude β₂ (Eq.6)
+        n_vt=1.0,  # oscillation frequency (Eq.5-6)
+        virtual_target_duration=20,  # ticks to chase virtual target
+    )
+    apf = ImprovedAPF(
+        p,
+        static_circles=INTERNAL_CIRCLES,
+        static_rects=INTERNAL_RECTS,
     )
 
     # ── 3. Agent definitions ────────────────────────────────────────────────
@@ -273,7 +284,7 @@ if __name__ == '__main__':
         robot = fleet.add_robot(
             rid,
             filter_alpha     = 0.5,
-            goal_tolerance   = 0.3,   # Reduced from 0.8 - prevents premature "goal reached"
+goal_tolerance = 1.5, # A* last waypoint is ~1m from goal, need tolerance > path precision
             lookahead_window = 20,   # wider scan — better for sparse A* paths
             carrot_steps     = 8,    # further carrot — smoother following in large world
         )

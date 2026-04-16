@@ -489,10 +489,12 @@ class IntentionBlender:
     def __init__(
         self,
         apf: APF,
-        max_pref_speed: float = 0.26,    # clip V_pref to this speed [m/s]
+        max_pref_speed: float = 0.26, # clip V_pref to this speed [m/s]
+        robot_id: str = 'default',
     ):
-        self.apf             = apf
-        self.max_pref_speed  = max_pref_speed
+        self.apf = apf
+        self.max_pref_speed = max_pref_speed
+        self.robot_id = robot_id
 
     def compute(
         self,
@@ -523,7 +525,8 @@ class IntentionBlender:
         # (the attractive pull is handled by the waypoint tracker above)
         # goal_pos enables ImprovedAPF's GNRO fix (rho_g calculation). If None,
         # ImprovedAPF silently falls back to classical behaviour.
-        F_unknown = self.apf.get_repulsive_only(robot_pos, dyn_obs, goal_pos=goal_pos)
+        # robot_id enables per-robot LocalMinimaState tracking.
+        F_unknown = self.apf.get_repulsive_only(robot_pos, dyn_obs, goal_pos=goal_pos, robot_id=self.robot_id)
 
         f_mag = np.linalg.norm(F_unknown)
 
@@ -929,7 +932,7 @@ class RobotController:
             carrot_steps     = carrot_steps,
             goal_tolerance   = goal_tolerance,
         )
-        self.blender = IntentionBlender(apf, max_pref_speed=cfg.max_linear_speed)
+        self.blender = IntentionBlender(apf, max_pref_speed=cfg.max_linear_speed, robot_id=robot_id)
         self.orca = NHORCAPlanner(cfg)
         self.mapper = MotorMapper(cfg, filter_alpha=filter_alpha)
         self.emergency = EmergencyBrake(
@@ -1461,7 +1464,6 @@ def build_figure(
     # Four walls around the world perimeter — dark gray, solid
     from matplotlib.patches import Rectangle as Rect2D
     wall_color = 'dimgray'
-    wall_color = 'dimgray'
     wall_alpha = 0.6
     W = 0.15  # wall thickness [m]
     ax.add_patch(Rect2D((0, 0), W, world_size,
@@ -1486,8 +1488,26 @@ def build_figure(
         gx, gy = data['goal']
         color  = data['color']
         ax.scatter(gx, gy, s=220, c=color, marker='*', zorder=5)
-        ax.annotate(f"Goal {rid}", (gx, gy),
-                    textcoords='offset points', xytext=(6, 6), fontsize=8)
+    ax.annotate(f"Goal {rid}", (gx, gy),
+                 textcoords='offset points', xytext=(6, 6), fontsize=8)
+
+    # ── Trajectory prediction lines ─────────────────────────────────────
+    # Show where each robot expects to go based on current velocity
+    traj_lines = {}
+    for rid in agent_data:
+        color = agent_data[rid]['color']
+        traj_lines[rid], = ax.plot([], [], color=color, linestyle=':',
+                                   linewidth=1.5, alpha=0.5, zorder=1)
+
+    # ── Yield indicator rings ────────────────────────────────────────────
+    # Yellow dashed ring around yielding robots
+    yield_rings = {}
+    for rid in agent_data:
+        x0, y0, _ = histories[rid][0]
+        yield_rings[rid] = Circle((x0, y0), r * 1.8, fill=False,
+                                  color='gold', linewidth=2.5,
+                                  linestyle='--', zorder=6, alpha=0.0)
+        ax.add_patch(yield_rings[rid])
 
     # ── Per-robot dynamic artists ─────────────────────────────────────────
     r = fleet.cfg.robot_radius
@@ -1547,28 +1567,45 @@ def build_figure(
                 [y, y + r * math.sin(theta)]
             )
 
-            # Wheel positions (perpendicular to heading)
-            # Left wheel centre
-            lx = x - (L / 2) * math.sin(theta)
-            ly = y + (L / 2) * math.cos(theta)
-            # Right wheel centre
-            rx = x + (L / 2) * math.sin(theta)
-            ry = y - (L / 2) * math.cos(theta)
+        # Wheel positions (perpendicular to heading)
+        # Left wheel centre
+        lx = x - (L / 2) * math.sin(theta)
+        ly = y + (L / 2) * math.cos(theta)
+        # Right wheel centre
+        rx = x + (L / 2) * math.sin(theta)
+        ry = y - (L / 2) * math.cos(theta)
 
-            # Draw each wheel as a short line along heading direction
-            left_wheels[rid].set_data(
-                [lx - wl * math.cos(theta), lx + wl * math.cos(theta)],
-                [ly - wl * math.sin(theta), ly + wl * math.sin(theta)]
-            )
-            right_wheels[rid].set_data(
-                [rx - wl * math.cos(theta), rx + wl * math.cos(theta)],
-                [ry - wl * math.sin(theta), ry + wl * math.sin(theta)]
-            )
+        # Draw each wheel as a short line along heading direction
+        left_wheels[rid].set_data(
+            [lx - wl * math.cos(theta), lx + wl * math.cos(theta)],
+            [ly - wl * math.sin(theta), ly + wl * math.sin(theta)]
+        )
+        right_wheels[rid].set_data(
+            [rx - wl * math.cos(theta), rx + wl * math.cos(theta)],
+            [ry - wl * math.sin(theta), ry + wl * math.sin(theta)]
+        )
 
-            artists.extend([
-                trail_lines[rid], body_patches[rid],
-                heading_lines[rid], left_wheels[rid], right_wheels[rid]
-            ])
+        # ── Trajectory prediction ─────────────────────────────────────────
+        ctrl = fleet.robots[rid]
+        vel = ctrl.state.vel
+        tau_viz = 3.0  # predict 3 seconds ahead
+        traj_pts = [(x, y)]
+        for t in np.linspace(0, tau_viz, 20):
+            traj_pts.append((x + vel[0] * t, y + vel[1] * t))
+        traj_lines[rid].set_data([p[0] for p in traj_pts], [p[1] for p in traj_pts])
+
+        # ── Yield indicator ring ───────────────────────────────────────────
+        if ctrl.is_yielding:
+            yield_rings[rid].center = (x, y)
+            yield_rings[rid].set_alpha(0.9)
+        else:
+            yield_rings[rid].set_alpha(0.0)
+
+        artists.extend([
+            trail_lines[rid], body_patches[rid],
+            heading_lines[rid], left_wheels[rid], right_wheels[rid],
+            traj_lines[rid], yield_rings[rid]
+        ])
 
         return artists
 
