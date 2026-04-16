@@ -583,12 +583,10 @@ class MotorMapper:
         cfg:          DiffDriveConfig,
         filter_alpha: float = 0.25,
     ):
-        self.cfg    = cfg
-        self.alpha  = filter_alpha
-        self._prev_v_raw = 0.0
-        self._prev_w_raw = 0.0
+        self.cfg = cfg
+        self.alpha = filter_alpha
         self._prev_heading_error = 0.0
-        self.heading_alpha = 0.3  # EMA smoothing for heading
+        self.heading_alpha = 0.3 # EMA smoothing for heading
 
     def compute(
         self,
@@ -685,47 +683,11 @@ class MotorMapper:
         v_act, w_act = wheels_to_unicycle(vl, vr, cfg.wheel_base)
 
         return WheelCommand(v=v_act, omega=w_act, vl=vl, vr=vr)
-        v_accel_limited = float(np.clip(v_accel_limited, 0.0, cfg.max_linear_speed))
-
-        w_accel_limited = self._prev_w_raw + np.clip(
-            omega_raw - self._prev_w_raw,
-            -cfg.max_angular_accel * dt,
-            cfg.max_angular_accel * dt
-        )
-        w_accel_limited = float(np.clip(w_accel_limited, -cfg.max_angular_speed, cfg.max_angular_speed))
-
-        self._prev_v_raw = v_accel_limited
-        self._prev_w_raw = w_accel_limited
-
-        coupled_factor = 1.0 - min(abs(w_accel_limited) / cfg.max_angular_speed, 1.0) * 0.6
-        v_coupled = v_accel_limited * coupled_factor
-
-        vl, vr = unicycle_to_wheels(
-            v_coupled, w_accel_limited, cfg.wheel_base, cfg.max_wheel_speed
-        )
-
-        v_actual, omega_actual = wheels_to_unicycle(vl, vr, cfg.wheel_base)
-
-        return WheelCommand(
-            v     = v_actual,
-            omega = omega_actual,
-            vl    = vl,
-            vr    = vr
-        )
-
-        # ── Reconstruct v, ω from clipped wheel speeds ───────────────────
-        # (wheel clip may have changed the actual v and ω)
-        v_actual, omega_actual = wheels_to_unicycle(vl, vr, cfg.wheel_base)
-
-        return WheelCommand(
-            v     = v_actual,
-            omega = omega_actual,
-            vl    = vl,
-            vr    = vr
-        )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────────
+    # EMERGENCY BRAKE — hard geometric safety net
+    # ─────────────────────────────────────────────────────────────────────────────
 # EMERGENCY BRAKE — hard geometric safety net
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -959,12 +921,16 @@ class RobotController:
         self._last_v_pref = np.zeros(2)
         self._last_v_safe = np.zeros(2)
 
-        # Yield coordination state (set by FleetManager._detect_and_assign_yields)
-        self.yield_priority: int = 0  # 0=normal, higher=has right-of-way
-        self.is_yielding: bool = False  # True = commanded to yield by fleet
-        self._forced_stop: bool = False  # True = fleet commanded hard stop
-        self.path_progress: float = 0.0  # fraction 0..1 of waypoints already passed
-        self._yield_mode: bool = False  # True = soft-yield (creep speed)
+# Yield coordination state (set by FleetManager._detect_and_assign_yields)
+        # KEY DESIGN: soft yield only — we scale V_pref before ORCA, never hard-stop.
+        # _forced_stop was removed because it caused permanent deadlock: the robot
+        # stops, ORCA's next tick sees vel=(0,0), but path_progress doesn't advance,
+        # so _forced_stop stays True forever.
+        self.yield_priority: int = 0 # 0=normal, higher=has right-of-way
+        self.is_yielding: bool = False # True = commanded to slow by fleet
+        self._yield_ticks_left: int = 0 # countdown — yield auto-releases after N ticks
+        self._yield_scale: float = 1.0 # 1.0 = full speed, 0.30-0.60 = soft yield
+        self.path_progress: float = 0.0 # fraction 0..1 of waypoints already passed
 
         self.logger = PipelineLogger(robot_id, print_every=100)
 
@@ -1054,23 +1020,36 @@ class RobotController:
             goal_pos = goal_pos, # carrot → ImprovedAPF rho_g (Eq.1-3)
         )
 
-        # ── Phase 5: NH-ORCA → V_safe ─────────────────────────────────────
+# ── Fleet yield: reduce V_pref BEFORE ORCA (critical ordering) ───
+    # By reducing V_pref here, ORCA sees the correct intended velocity.
+    # This means other robots' ORCA correctly predicts "A is slowing",
+    # preventing the velocity mismatch that caused ghost collisions.
+    # The _yield_ticks_left countdown handles auto-release.
+        if self.is_yielding and self._yield_scale < 1.0:
+            v_pref = v_pref * self._yield_scale
+            self._yield_ticks_left -= 1
+            if self._yield_ticks_left <= 0:
+                self.is_yielding = False
+                self._yield_scale = 1.0
+
+    # ── Phase 5: NH-ORCA → V_safe ─────────────────────────────────────
         neighbors = [
             SwarmAgent(
-                pos       = np.array([t.x, t.y]),
-                vel       = np.array([t.vx, t.vy]),
-                radius    = t.radius,
+                pos = np.array([t.x, t.y]),
+                vel = np.array([t.vx, t.vy]),
+                radius = t.radius,
                 max_speed = self.cfg.max_linear_speed,
             )
-            for t in swarm_telemetry           # ONLY swarm agents
+            for t in swarm_telemetry # ONLY swarm agents
         ]
         v_safe_vx, v_safe_vy = self.orca.update(
-            my_pos    = tuple(pos),
-            my_vel    = tuple(vel),
-            my_yaw    = yaw,
-            pref_vel  = tuple(v_pref),
+            my_pos = tuple(pos),
+            my_vel = tuple(vel),
+            my_yaw = yaw,
+            pref_vel = tuple(v_pref), # ORCA receives the already-scaled V_pref
             neighbors = neighbors,
         )
+        
         # Reconstruct 2D V_safe from (v, ω)
         # For debug/log — actual command is already in (v, ω)
         v_safe_2d = np.array([v_safe_vx, v_safe_vy])
@@ -1113,20 +1092,20 @@ class RobotController:
             camera_blobs=camera_blobs,
         )
 
-        # ── Fleet-level yield/stop override ──────────────────────────────
-        if self._forced_stop:
-            return WheelCommand(v=0.0, omega=0.0, vl=0.0, vr=0.0)
-
+# ── Fleet-level soft yield override ──────────────────────────────
+    # IMPORTANT: yield scaling was ALREADY applied to V_pref before ORCA
+    # in the Phase 4/5 section above. _yield_ticks_left was decremented there.
+    # is_yielding was set to False when _yield_ticks_left hit 0.
+    # Here we just apply one final soft-scale to the wheel command as a
+    # safety net, ensuring the command truly reflects the yield intent.
+    # We keep omega (steering direction) — freezing omega caused oscillations.
         if self.is_yielding:
-            # Yielding: reduce speed to near-zero to allow passing
-            # We do this by scaling down the velocity command
-            yield_scale = 0.05  # 5% of normal speed = creep
-            return WheelCommand(
-                v=cmd.v * yield_scale,
-                omega=cmd.omega * yield_scale,
-                vl=cmd.vl * yield_scale,
-                vr=cmd.vr * yield_scale,
-            )
+            cmd = WheelCommand(
+                v = cmd.v * self._yield_scale,
+                omega = cmd.omega, # keep steering — don't freeze direction
+                vl = cmd.vl * self._yield_scale,
+                vr = cmd.vr * self._yield_scale,
+        )
 
         return cmd
 
@@ -1188,7 +1167,7 @@ class FleetManager:
         ctrl = RobotController(robot_id, self.cfg, self.apf, **kwargs)
         self.robots[robot_id] = ctrl
         return ctrl
-
+    
     def update_state(
         self,
         robot_id: str,
@@ -1203,7 +1182,7 @@ class FleetManager:
         """Set a goal for one robot."""
         if robot_id in self.robots:
             self.robots[robot_id].set_goal(gx, gy)
-
+    
     def tick_all(
         self,
         camera_blobs: List[CameraBlob] = None, # shared across all robots
@@ -1233,7 +1212,7 @@ class FleetManager:
                 y        = ctrl.state.pose.y,
                 vx       = ctrl.state.vel[0],
                 vy       = ctrl.state.vel[1],
-                radius   = self.cfg.inflated_radius,
+radius = self.cfg.social_radius, # uses 20% virtual bubble — other robots plan around the 20% clearance
             )
             for rid, ctrl in self.robots.items()
         }
@@ -1256,79 +1235,125 @@ class FleetManager:
             )
 
         return commands
-
+    
     def _detect_and_assign_yields(self):
         """
-        Predict trajectory conflicts between robots using motion prediction.
-        The lower path_progress robot (less committed to its path) yields,
-        allowing the higher-progress robot to continue without conflict.
-
-        Algorithm (per robot pair):
-        1. Project both robots' positions forward using current velocity + time_horizon
-        2. Solve quadratic: ||pos_a + t*vel_a - (pos_b + t*vel_b)|| = conflict_dist
-        3. If a solution exists for t in (0, tau] → trajectories intersect within horizon
-        4. Lower path_progress robot yields (more flexibility to stop/replan)
+        Predict trajectory conflicts and assign SOFT yield (speed reduction).
+    
+        KEY DIFFERENCES from old version:
+        ----------------------------------
+        OLD: used _forced_stop → hard zero velocity → ORCA mismatch → deadlock
+        NEW: uses _yield_scale → proportional speed reduction → ORCA stays valid
+    
+        Why soft yield works:
+        - We reduce the yielding robot's V_pref magnitude before ORCA runs
+        - ORCA sees the correct reduced velocity and plans half-planes accordingly
+        - The other robot's ORCA correctly predicts "A is slowing" (not "A is stopped")
+        - No mismatch → no ghost collisions
+    
+        Yield assignment rule:
+        - Lower path_progress (less committed) yields
+        - Yield is soft: speed scales to _yield_scale (default 30%)
+        - Yield auto-releases after _yield_ticks_left countdown expires
+        - BOTH robots slow at crossings (60%/40%) — like real human negotiation
+        - If robots are clearly separated (gap > CONFLICT_CLEAR_DIST), skip yield
         """
+        YIELD_DURATION_TICKS = 25 # auto-release after 2.5s at 10Hz
+        CONFLICT_TIME_WINDOW = 2.5 # [s] — only react to conflicts within 2.5s
+        CONFLICT_CLEAR_DIST = 2.5 # [m] — surface gap to deactivate yield
+        YIELD_FAST_SCALE = 0.60 # higher path_progress → 60% speed
+        YIELD_SLOW_SCALE = 0.40 # lower path_progress → 40% speed (more conservative)
+    
+        # Combine inflated radii for conflict zone (use same radius as ORCA)
+        combined_r = self.cfg.inflated_radius * 2.0
+    
         for ctrl in self.robots.values():
-            ctrl.is_yielding = False
-            ctrl._forced_stop = False
-
+            # NOTE: We do NOT clear is_yielding here.
+            # If is_yielding is already True (from previous tick), we keep it.
+            # The _yield_ticks_left countdown in tick() handles auto-release.
+            # Only clear if the robot has reached its goal.
+            if ctrl.reached_goal:
+                ctrl.is_yielding = False
+                ctrl._yield_scale = 1.0
+                ctrl._yield_ticks_left = 0
+    
         robot_ids = list(self.robots.keys())
         tau = self.cfg.time_horizon
-        combined_radius = self.cfg.inflated_radius * 2.0
-        conflict_buffer = 1.0
-        conflict_dist = combined_radius + conflict_buffer
-
+    
         for i, rid_a in enumerate(robot_ids):
             for rid_b in robot_ids[i + 1:]:
                 ctrl_a = self.robots[rid_a]
                 ctrl_b = self.robots[rid_b]
-
+    
+                # Skip if either robot already at goal (clear path)
+                if ctrl_a.reached_goal or ctrl_b.reached_goal:
+                    continue
+    
                 pos_a = np.array([ctrl_a.state.pose.x, ctrl_a.state.pose.y])
                 pos_b = np.array([ctrl_b.state.pose.x, ctrl_b.state.pose.y])
                 vel_a = ctrl_a.state.vel
                 vel_b = ctrl_b.state.vel
-
-                # Relative motion: when will distance between them be < conflict_dist?
-                # Solve: ||pos_a + t*vel_a - (pos_b + t*vel_b)||^2 = conflict_dist^2
+    
+                # ── Check current surface gap first ──────────────────────
+                current_dist = float(np.linalg.norm(pos_a - pos_b))
+                surface_gap = current_dist - combined_r
+                if surface_gap > CONFLICT_CLEAR_DIST:
+                    continue # far apart — no yield needed
+    
+                # ── Trajectory intersection test ─────────────────────────
                 rel_pos = pos_b - pos_a
-                rel_vel = vel_a - vel_b  # velocity of A relative to B
-
-                a_coef = float(np.dot(rel_vel, rel_vel))
-                b_coef = 2.0 * float(np.dot(rel_pos, rel_vel))
-                c_coef = float(np.dot(rel_pos, rel_pos)) - conflict_dist ** 2
-
+                rel_vel = vel_a - vel_b
+    
+                a_c = float(np.dot(rel_vel, rel_vel))
+                b_c = 2.0 * float(np.dot(rel_pos, rel_vel))
+                c_c = float(np.dot(rel_pos, rel_pos)) - combined_r ** 2
+    
                 will_conflict = False
-                time_to_conflict = float('inf')
-
-                if a_coef < 1e-9:
-                    # Nearly parallel motion — check if current distance is already < conflict_dist
-                    if c_coef < 0:
-                        will_conflict = True
-                        time_to_conflict = 0.0
+                if a_c < 1e-9:
+                    will_conflict = (c_c < 0) # already overlapping
                 else:
-                    discriminant = b_coef ** 2 - 4.0 * a_coef * c_coef
-                    if discriminant >= 0:
-                        sqrt_disc = math.sqrt(discriminant)
-                        t1 = (-b_coef - sqrt_disc) / (2.0 * a_coef)
-                        t2 = (-b_coef + sqrt_disc) / (2.0 * a_coef)
-                        # Check both roots — conflict occurs when robot pair enters conflict zone
+                    disc = b_c ** 2 - 4.0 * a_c * c_c
+                    if disc >= 0:
+                        sq = math.sqrt(disc)
+                        t1 = (-b_c - sq) / (2.0 * a_c)
+                        t2 = (-b_c + sq) / (2.0 * a_c)
                         for t in (t1, t2):
-                            if 0.0 < t <= tau:
+                            if 0.0 < t <= CONFLICT_TIME_WINDOW:
                                 will_conflict = True
-                                if t < time_to_conflict:
-                                    time_to_conflict = t
                                 break
-
-                if will_conflict:
-                    # Lower path_progress yields (less committed to path = easier to stop)
-                    if ctrl_a.path_progress < ctrl_b.path_progress:
+    
+                if not will_conflict:
+                    continue
+    
+                # ── Both robots slow proportionally at crossings ──────────
+                # Higher path_progress = more "right of way" = slightly faster (60%)
+                # Lower path_progress = less committed = slower (40%)
+                # This mirrors human behavior: both cars at a crossing both slow
+                # down, and the one that arrived first / is more committed goes first.
+                progress_a = ctrl_a.path_progress
+                progress_b = ctrl_b.path_progress
+    
+                if progress_a >= progress_b:
+                    ctrl_a._yield_scale = YIELD_FAST_SCALE  # 0.60
+                    ctrl_a._yield_ticks_left = YIELD_DURATION_TICKS
+                    if not ctrl_a.is_yielding:
                         ctrl_a.is_yielding = True
-                        ctrl_a._forced_stop = True
-                    else:
+    
+                    ctrl_b._yield_scale = YIELD_SLOW_SCALE  # 0.40
+                    ctrl_b._yield_ticks_left = YIELD_DURATION_TICKS
+                    if not ctrl_b.is_yielding:
                         ctrl_b.is_yielding = True
-                        ctrl_b._forced_stop = True
-
+                else:
+                    ctrl_a._yield_scale = YIELD_SLOW_SCALE
+                    ctrl_a._yield_ticks_left = YIELD_DURATION_TICKS
+                    if not ctrl_a.is_yielding:
+                        ctrl_a.is_yielding = True
+    
+                    ctrl_b._yield_scale = YIELD_FAST_SCALE
+                    ctrl_b._yield_ticks_left = YIELD_DURATION_TICKS
+                    if not ctrl_b.is_yielding:
+                        ctrl_b.is_yielding = True
+    
     def get_fleet_debug(self) -> List[Dict]:
         """Return debug info for all robots (for logging / visualisation)."""
         return [ctrl.get_debug_info() for ctrl in self.robots.values()]

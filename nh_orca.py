@@ -86,11 +86,35 @@ class DiffDriveConfig:
     world_y_min: float = 0.0
     world_y_max: float = 20.0
     boundary_buffer: float = 0.5 # minimum gap from wall [m]
+    # ── Social bubble (virtual safety margin) ──────────────────────────
+    # The "virtual bubble" used in ORCA planning between swarm robots.
+    # robot_radius * (1 + social_bubble_factor) = the clearance ORCA enforces.
+    # 0.20 = 20% extra — keeps robots 20% further apart than physical edge.
+    # This is SEPARATE from tracking_error (which is for NH math correctness).
+    # Total ORCA planning radius = robot_radius × (1 + factor) + tracking_error
+    social_bubble_factor: float = 0.20
 
     @property
     def inflated_radius(self) -> float:
-        """r + ε — radius used inside ORCA math."""
+        """r + ε — radius used inside NHORCAPlanner's own LP (kinematic correctness)."""
         return self.robot_radius + self.tracking_error
+
+    @property
+    def social_radius(self) -> float:
+        """
+        Radius passed in SwarmTelemetry to other robots' ORCA planners.
+        = physical radius × (1 + social_bubble_factor) + tracking_error
+
+        Example (robot_radius=1.0, factor=0.20, tracking_error=0.5):
+        social_radius = 1.0 × 1.20 + 0.5 = 1.70m
+
+        Combined radius between two robots = 2 × 1.70 = 3.40m.
+        ORCA will keep robot centres at least 3.40m apart.
+
+        Note: inflated_radius (r + ε = 1.5m) is still used in NH kinematic math.
+        social_radius (1.7m) is used in ORCA planning for clearance.
+        """
+        return self.robot_radius * (1.0 + self.social_bubble_factor) + self.tracking_error
 
 
 # ─────────────────────────────────────────────────────────────────────────────
