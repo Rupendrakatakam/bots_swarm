@@ -75,9 +75,9 @@ def build_figure(fleet, agent_data, global_paths, histories,
                   camera_blobs=None, blob_history=None):
 
     static_circles = static_circles or []
-    static_rects   = static_rects   or []
-    camera_blobs   = camera_blobs   or []
-    blob_history   = blob_history   or []
+    static_rects = static_rects or []
+    camera_blobs = camera_blobs or []
+    blob_history = blob_history or []
 
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.set_xlim(0, world_size)
@@ -88,82 +88,90 @@ def build_figure(fleet, agent_data, global_paths, histories,
     ax.set_yticks(np.arange(0, world_size + 1, 1))
     ax.grid(True, linestyle=':', alpha=0.5)
 
-    eps = fleet.cfg.tracking_error
+    # ── Solid boundary walls ────────────────────────────────────────────
+    wall_color = 'dimgray'
+    wall_alpha = 0.6
+    ax.add_patch(Rectangle((0.0, 0.0), world_size, 0.3,
+        color=wall_color, alpha=wall_alpha, zorder=2))
+    ax.add_patch(Rectangle((0.0, world_size - 0.3), world_size, 0.3,
+        color=wall_color, alpha=wall_alpha, zorder=2))
+    ax.add_patch(Rectangle((0.0, 0.0), 0.3, world_size,
+        color=wall_color, alpha=wall_alpha, zorder=2))
+    ax.add_patch(Rectangle((world_size - 0.3, 0.0), 0.3, world_size,
+        color=wall_color, alpha=wall_alpha, zorder=2))
 
-    # Static obstacles
+    # ── Static circle obstacles (solid fill, no dashed overlay) ─────────
     for obs in static_circles:
         ax.add_patch(Circle((obs.cx, obs.cy), obs.radius,
-                            color='red', alpha=0.35, zorder=2))
-        ax.add_patch(Circle((obs.cx, obs.cy), obs.radius + eps,
-                            fill=False, color='orange', linestyle='--',
-                            linewidth=1.2, zorder=2))
+            color='red', alpha=0.45, zorder=2))
 
-    for obs in static_rects:
-        x0, y0, x1, y1 = obs.bounds
-        ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0,
-                                color='red', alpha=0.35, zorder=2))
-        ax.add_patch(Rectangle((x0 - eps, y0 - eps),
-                                (x1 - x0) + 2*eps, (y1 - y0) + 2*eps,
-                                fill=False, color='orange', linestyle='--',
-                                linewidth=1.2, zorder=2))
+    # ── Camera blob history trail ────────────────────────────────────────
+    if len(blob_history) > 1:
+        ax.plot([p[0] for p in blob_history], [p[1] for p in blob_history],
+            color='darkviolet', linestyle=':', linewidth=1.0, alpha=0.35, zorder=1)
 
-    # Camera blobs - visualize unknown dynamic obstacles
-    # No trailing path - just show current blob position
-
-    # Dynamic blob patch (will be updated in animation)
-    # Use mutable container for proper closure capture
+    # ── Dynamic blob patch ───────────────────────────────────────────────
     blob_patch_container = [None]
     if len(blob_history) > 0:
         bx, by = blob_history[0]
         blob_patch_container[0] = Circle((bx, by), 1.3, color='darkviolet', alpha=0.7, zorder=4)
         ax.add_patch(blob_patch_container[0])
 
-    # A* paths
+    # ── A* paths ─────────────────────────────────────────────────────────
     for rid, path in global_paths.items():
         color = agent_data[rid]['color']
         ax.plot([p[0] for p in path], [p[1] for p in path],
-                color=color, linestyle='--', linewidth=1.5, alpha=0.4, zorder=1)
+            color=color, linestyle='--', linewidth=1.5, alpha=0.4, zorder=1)
 
-    # Goals
+    # ── Goals ────────────────────────────────────────────────────────────
     for rid, data in agent_data.items():
         gx, gy = data['goal']
-        ax.scatter(gx, gy, s=220, c=data['color'], marker='*', zorder=5)
+        color = data['color']
+        ax.scatter(gx, gy, s=220, c=color, marker='*', zorder=5)
         ax.annotate(f"Goal {rid}", (gx, gy),
-                    textcoords='offset points', xytext=(5, 5), fontsize=8)
+            textcoords='offset points', xytext=(5, 5), fontsize=8)
 
-    # Start markers
+    # ── Start markers ────────────────────────────────────────────────────
     for rid, data in agent_data.items():
         sx, sy, _ = data['start']
         ax.scatter(sx, sy, s=120, c=data['color'], marker='s',
-                   zorder=5, alpha=0.5)
+            zorder=5, alpha=0.5)
 
     r = fleet.cfg.robot_radius
     L = fleet.cfg.wheel_base
     wl = L * 0.6
 
-    body_patches  = {}
+    # ── Social bubble radius ─────────────────────────────────────────────
+    social_bubble_factor = getattr(fleet.cfg, 'social_bubble_factor', 0.20)
+    social_r = r * (1.0 + social_bubble_factor)
+
+    body_patches = {}
     heading_lines = {}
-    trail_lines   = {}
-    left_wheels   = {}
-    right_wheels  = {}
+    trail_lines = {}
+    left_wheels = {}
+    right_wheels = {}
+    bubble_patches = {}
 
     for rid, data in agent_data.items():
         color = data['color']
         x0, y0, _ = histories[rid][0]
-        body_patches[rid]  = Circle((x0, y0), r, color=color, alpha=0.6, zorder=4)
+        body_patches[rid] = Circle((x0, y0), r, color=color, alpha=0.6, zorder=4)
         ax.add_patch(body_patches[rid])
         heading_lines[rid], = ax.plot([], [], 'k-', linewidth=2, zorder=5)
-        trail_lines[rid],   = ax.plot([], [], color=color, linewidth=1.8,
-                                       alpha=0.65, zorder=3)
-        left_wheels[rid],   = ax.plot([], [], 'k-', linewidth=4,
-                                       solid_capstyle='round', zorder=5)
-        right_wheels[rid],  = ax.plot([], [], 'k-', linewidth=4,
-                                       solid_capstyle='round', zorder=5)
+        trail_lines[rid], = ax.plot([], [], color=color, linewidth=1.8,
+            alpha=0.65, zorder=3)
+        left_wheels[rid], = ax.plot([], [], 'k-', linewidth=4,
+            solid_capstyle='round', zorder=5)
+        right_wheels[rid], = ax.plot([], [], 'k-', linewidth=4,
+            solid_capstyle='round', zorder=5)
+        bubble_patches[rid] = Circle((x0, y0), social_r, fill=False,
+            color=color, linewidth=1.5, linestyle='--', alpha=0.45, zorder=3)
+        ax.add_patch(bubble_patches[rid])
 
-    step_text  = ax.text(0.02, 0.97, '', transform=ax.transAxes,
-                          fontsize=10, va='top')
+    step_text = ax.text(0.02, 0.97, '', transform=ax.transAxes,
+        fontsize=10, va='top')
     speed_text = ax.text(0.02, 0.93, '', transform=ax.transAxes,
-                          fontsize=8, va='top', color='gray')
+        fontsize=8, va='top', color='gray')
 
     def update(frame):
         artists = [step_text, speed_text]
@@ -172,17 +180,17 @@ def build_figure(fleet, agent_data, global_paths, histories,
         speeds = []
         for rid in agent_data:
             hist = histories[rid]
-            f    = min(frame, len(hist) - 1)
+            f = min(frame, len(hist) - 1)
             x, y, theta = hist[f]
 
             trail_lines[rid].set_data([p[0] for p in hist[:f+1]],
-                                       [p[1] for p in hist[:f+1]])
+                                      [p[1] for p in hist[:f+1]])
             body_patches[rid].center = (x, y)
             heading_lines[rid].set_data([x, x + r*math.cos(theta)],
-                                         [y, y + r*math.sin(theta)])
+                                        [y, y + r*math.sin(theta)])
 
-            lx = x - (L/2)*math.sin(theta);  ly = y + (L/2)*math.cos(theta)
-            rx = x + (L/2)*math.sin(theta);  ry = y - (L/2)*math.cos(theta)
+            lx = x - (L/2)*math.sin(theta); ly = y + (L/2)*math.cos(theta)
+            rx = x + (L/2)*math.sin(theta); ry = y - (L/2)*math.cos(theta)
 
             left_wheels[rid].set_data(
                 [lx - wl*math.cos(theta), lx + wl*math.cos(theta)],
@@ -191,23 +199,33 @@ def build_figure(fleet, agent_data, global_paths, histories,
                 [rx - wl*math.cos(theta), rx + wl*math.cos(theta)],
                 [ry - wl*math.sin(theta), ry + wl*math.sin(theta)])
 
+            bubble_patches[rid].center = (x, y)
+
+            debug = fleet.robots[rid].get_debug_info()
+            v_path = debug['v_path']
+            v_pref = debug['v_pref']
+            v_safe = debug['v_safe']
+
+            artists.extend([
+                trail_lines[rid], body_patches[rid],
+                heading_lines[rid], left_wheels[rid],
+                right_wheels[rid], bubble_patches[rid],
+            ])
+
             if f > 0:
                 dx = hist[f][0] - hist[f-1][0]
                 dy = hist[f][1] - hist[f-1][1]
                 spd = math.hypot(dx, dy) / 0.1
                 speeds.append(f"{rid}:{spd:.1f}")
 
-            artists.extend([trail_lines[rid], body_patches[rid],
-                             heading_lines[rid], left_wheels[rid],
-                             right_wheels[rid]])
-
-        speed_text.set_text('  '.join(speeds) + ' m/s')
+        speed_text.set_text(' '.join(speeds) + ' m/s')
 
         if blob_patch_container[0] is not None and frame < len(blob_history):
             bx, by = blob_history[frame]
             blob_patch_container[0].center = (bx, by)
+            artists.append(blob_patch_container[0])
 
-        return artists + ([blob_patch_container[0]] if blob_patch_container[0] is not None else [])
+        return artists
 
     return fig, update, max(len(h) for h in histories.values())
 
@@ -272,8 +290,9 @@ if __name__ == '__main__':
     # ── 3. Agent definitions ────────────────────────────────────────────────
     # Two robots - Robot A will pass near camera blob at (6,6) before static circle at (8,8)
     agent_data = {
-        'A': {'start': (2.0, 2.0, math.pi/4),       'goal': (18.0, 18.0), 'color': 'royalblue'},
-        'B': {'start': (2.0, 12.0, 0.0),            'goal': (18.0,  2.0), 'color': 'seagreen'},
+        'A': {'start': (2.0, 5.0, math.pi/4),'goal': (19.0, 18.0), 'color': 'royalblue'},
+        'B': {'start': (2.0, 15.0, 0.0),'goal': (15.0,  5.0), 'color': 'seagreen'},
+        'C': {'start': (2.0, 10.0, 0.0),'goal': (19.0,  14.0), 'color': 'yellow'},
     }
 
     # ── 4. Build fleet ─────────────────────────────────────────────────────
@@ -283,10 +302,10 @@ if __name__ == '__main__':
     for rid, data in agent_data.items():
         robot = fleet.add_robot(
             rid,
-            filter_alpha     = 0.5,
-goal_tolerance = 1.5, # A* last waypoint is ~1m from goal, need tolerance > path precision
+            filter_alpha     = 0.5, # for smoothing the velocity commands
+            goal_tolerance = 0.5, # A* last waypoint is ~1m from goal, need tolerance > path precision
             lookahead_window = 20,   # wider scan — better for sparse A* paths
-            carrot_steps     = 8,    # further carrot — smoother following in large world
+            carrot_steps     = 10,    # further carrot — smoother following in large world
         )
         sx, sy, stheta = data['start']
         gx, gy = data['goal']
