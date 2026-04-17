@@ -280,6 +280,7 @@ class SwarmAgent:
     vel:       np.ndarray   # [vx, vy]
     radius:    float        # inflated radius (r + ε)
     max_speed: float
+    c:         float = 0.5   # 0.5=equal responsibility, 1.0=ego avoids all
 
 
 @dataclass
@@ -494,7 +495,7 @@ class NHORCAPlanner:
         for nb in neighbors:
             if np.linalg.norm(nb.pos - ego.pos) > cfg.neighbor_dist:
                 continue
-            hp = compute_orca_halfplane(ego, nb, cfg.time_horizon, c=0.5)
+            hp = compute_orca_halfplane(ego, nb, cfg.time_horizon, c=nb.c)
             if hp is not None:
                 halfplanes.append(hp)
 

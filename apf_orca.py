@@ -81,14 +81,6 @@ class RobotState:
     prev_w:   float        = 0.0
 
 
-@dataclass
-class CameraBlob:
-    """
-    One unknown obstacle detection from the overhead camera.
-    Position, estimated size, and velocity estimate for prediction.
-    """
-    x:      float
-    y:      float
     radius: float   = 0.30   # estimated bounding radius [m]
     priority: float = 1.0    # repulsion multiplier (1.0 = normal)
     # Velocity estimate (filled by simulation, estimated from camera in real system)
@@ -117,6 +109,20 @@ class WheelCommand:
     omega: float = 0.0   # angular speed [rad/s]
     vl:    float = 0.0   # left wheel    [m/s]
     vr:    float = 0.0   # right wheel   [m/s]
+
+@dataclass
+class CameraBlob:
+    """
+    One unknown obstacle detection from the overhead camera.
+    Position, estimated size, and velocity estimate for prediction.
+    """
+    x:      float
+    y:      float
+    radius: float   = 0.30   # estimated bounding radius [m]
+    priority: float = 1.0    # repulsion multiplier (1.0 = normal)
+    # Velocity estimate (filled by simulation, estimated from camera in real system)
+    vx: float = 0.0
+    vy: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -627,7 +633,7 @@ class MotorMapper:
         self.cfg = cfg
         self.alpha = filter_alpha
         self._prev_heading_error = 0.0
-        self.heading_alpha = 0.5 # EMA smoothing for heading (was 0.3 — faster response for escape)
+        self.heading_alpha = 0.5 # EMA smoothing for heading
 
     def compute(
         self,
@@ -669,8 +675,9 @@ class MotorMapper:
         theta_err_raw = _wrap_angle(theta_H - yaw)
 
         # Smooth heading error with EMA
-        theta_err = (self.heading_alpha * theta_err_raw +
-                     (1.0 - self.heading_alpha) * self._prev_heading_error)
+        delta_err = _wrap_angle(theta_err_raw - self._prev_heading_error)
+        theta_err = _wrap_angle(self._prev_heading_error + self.heading_alpha * delta_err)
+        
         self._prev_heading_error = theta_err
 
         omega_target = float(np.clip(
@@ -687,12 +694,13 @@ class MotorMapper:
         ))
 
         # ── Coupling: large turn rate forces reduced forward speed ────────
-        # Physical constraint: vr = v + ω*L/2 ≤ max_wheel_speed
+        # Physical constraint: |v| + |ω|*L/2 ≤ max_wheel_speed
         v_coupled_limit = max(
             0.0,
             cfg.max_wheel_speed - abs(omega_target) * cfg.wheel_base / 2.0
         )
-        v_target = min(v_target, v_coupled_limit)
+        v_target_mag = min(abs(v_target), v_coupled_limit)
+        v_target = math.copysign(v_target_mag, v_target) if v_target != 0 else 0.0
 
         # ── Turn-aware speed: sharp turns → slow down (human behavior) ───
         # When the steering wheel is turned sharply, humans brake before the
@@ -715,7 +723,7 @@ class MotorMapper:
             dv_limited = min(dv, cfg.max_linear_accel * dt)
         else:
             dv_limited = max(dv, -cfg.max_linear_decel * dt)
-        v_filt = float(np.clip(state.prev_v + dv_limited, 0.0, cfg.max_linear_speed))
+        v_filt = float(np.clip(state.prev_v + dv_limited, -cfg.max_linear_speed, cfg.max_linear_speed))
 
         dw = omega_target - state.prev_w
         dw_limited = float(np.clip(
@@ -773,6 +781,7 @@ class EmergencyBrake:
         world_y_min: float = 0.0,
         world_y_max: float = 20.0,
         max_angular_speed: float = 5.0,  # for escape rotation during brake
+        cfg_wheel_base: float = 0.5,
     ):
         self.robot_radius      = robot_radius
         self.warn_dist         = warn_dist
@@ -785,6 +794,7 @@ class EmergencyBrake:
         self.world_y_min       = world_y_min
         self.world_y_max       = world_y_max
         self.cfg_max_angular   = max_angular_speed
+        self.cfg_wheel_base    = cfg_wheel_base
 
     def check(
         self,
@@ -846,39 +856,51 @@ class EmergencyBrake:
         if min_gap == float('inf') or closest_dir is None:
             return cmd
 
-        # ── Level 3: OVERLAP — always reverse, no heading check ──────────
-        # OLD: required heading INTO obstacle → let robots sit inside blobs
-        # NEW: any overlap triggers reverse unconditionally
+        # Determine if the closest obstacle is in front or behind the robot
+        dir_to_obs = -closest_dir  # closest_dir points FROM obs TO robot, so -closest_dir is TO obs
+        heading_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)])
+        obs_in_front = np.dot(dir_to_obs, heading_vec) > 0
+
+        # ── Level 3: OVERLAP — escape unconditionally ────────────────────
         if min_gap <= self.reverse_dist:
+            # If obstacle is in front, reverse away. If behind, sprint forward.
+            escape_v = -self.reverse_speed if obs_in_front else self.reverse_speed
             return WheelCommand(
-                v     = -self.reverse_speed,
-                omega = 0.0,                 # no steering while reversing — cleaner escape
-                vl    = -self.reverse_speed,
-                vr    = -self.reverse_speed,
+                v     = escape_v,
+                omega = cmd.omega,
+                vl    = escape_v - (cmd.omega * self.cfg_wheel_base / 2),
+                vr    = escape_v + (cmd.omega * self.cfg_wheel_base / 2),
             )
 
-        # ── Level 2: Hard brake ───────────────────────────────────────────
+        # ── Level 2: Hard brake / Sprint ─────────────────────────────────
         if min_gap <= self.brake_dist:
-            turn = float(np.cross(
-                np.array([math.cos(robot_yaw), math.sin(robot_yaw)]),
-                closest_dir
-            ))
+            turn = float(np.cross(heading_vec, closest_dir)) # closest_dir points AWAY from obs
             omega_escape = float(np.clip(turn * 2.0,
                                          -self.cfg_max_angular,
                                           self.cfg_max_angular))
-            return WheelCommand(v=0.0, omega=omega_escape, vl=0.0, vr=0.0)
+            # If it's behind, don't freeze! Keep moving forward while turning away
+            escape_v = 0.0 if obs_in_front else self.reverse_speed
+            return WheelCommand(
+                v     = escape_v,
+                omega = omega_escape,
+                vl    = escape_v - (omega_escape * self.cfg_wheel_base / 2),
+                vr    = escape_v + (omega_escape * self.cfg_wheel_base / 2)
+            )
 
         # ── Level 1: Proportional slowdown ───────────────────────────────
         if min_gap <= self.warn_dist:
-            t     = (min_gap - self.brake_dist) / max(self.warn_dist - self.brake_dist, 1e-6)
-            scale = self.slow_factor + (1.0 - self.slow_factor) * float(np.clip(t, 0.0, 1.0))
-            return WheelCommand(
-                v     = cmd.v     * scale,
-                omega = cmd.omega,
-                vl    = cmd.vl   * scale,
-                vr    = cmd.vr   * scale,
-            )
-
+            # Only slow down if the obstacle is in front!
+            # If it's chasing us from behind, slowing down guarantees a collision.
+            if obs_in_front:
+                t     = (min_gap - self.brake_dist) / max(self.warn_dist - self.brake_dist, 1e-6)
+                scale = self.slow_factor + (1.0 - self.slow_factor) * float(np.clip(t, 0.0, 1.0))
+                return WheelCommand(
+                    v     = cmd.v     * scale,
+                    omega = cmd.omega,
+                    vl    = cmd.vl   * scale,
+                    vr    = cmd.vr   * scale,
+                )
+            
         return cmd
 
 
@@ -962,6 +984,7 @@ class RobotController:
             world_y_min       = cfg.world_y_min,
             world_y_max       = cfg.world_y_max,
             max_angular_speed = cfg.max_angular_speed,
+            cfg_wheel_base    = cfg.wheel_base,
         )
 
         # State
@@ -1070,7 +1093,7 @@ class RobotController:
         v_pref = self.blender.compute(
             robot_pos = tuple(pos),
             v_path = v_path,
-            camera_blobs = camera_blobs, # ONLY unknown obstacles
+            camera_blobs = [], # Dynamic blobs removed from APF; ORCA handles them completely
             goal_pos = goal_pos, # carrot → ImprovedAPF rho_g (Eq.1-3)
         )
 
@@ -1103,8 +1126,32 @@ class RobotController:
                 radius = t.radius,
                 max_speed = self.cfg.max_linear_speed,
             )
-            for t in swarm_telemetry # ONLY swarm agents
+            for t in swarm_telemetry
         ]
+        
+        for b in camera_blobs:
+            neighbors.append(
+                SwarmAgent(
+                    pos = np.array([b.x, b.y]),
+                    vel = np.array([b.vx, b.vy]),
+                    radius = b.radius + 0.1,  # Added 10cm safety margin for unknown blobs
+                    max_speed = self.cfg.max_linear_speed,
+                    c = 1.0,  # uncooperative: ego takes full responsibility
+                )
+            )
+        
+        # Inject static circles as uncooperative obstacles (robot must avoid them entirely)
+        for obs in self.blender.apf.static_circles:
+            neighbors.append(
+                SwarmAgent(
+                    pos = np.array([obs.cx, obs.cy]),
+                    vel = np.zeros(2),  # static obstacle has zero velocity
+                    radius = obs.radius,
+                    max_speed = 0.0,   # static obstacle cannot move
+                    c = 1.0,           # uncooperative: ego takes full responsibility
+                )
+            )
+        
         v_safe_vx, v_safe_vy = self.orca.update(
             my_pos = tuple(pos),
             my_vel = tuple(vel),
@@ -1446,313 +1493,313 @@ def _optimal_v(V_H: float, theta_err: float) -> float:
 # MATPLOTLIB SIMULATION RUNNER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_simulation(
-    fleet:         FleetManager,
-    agent_data:    Dict,                  # {'robot_id': {'color': str, 'goal': (x,y)}}
-    camera_blobs:  List[CameraBlob] = None,
-    max_steps:     int   = 1500,
-    dt:            float = 0.1,
-) -> Dict[str, List[Tuple[float, float, float]]]:
-    """
-    Run the full FleetManager pipeline and collect (x, y, yaw) histories.
+# def run_simulation(
+#     fleet:         FleetManager,
+#     agent_data:    Dict,                  # {'robot_id': {'color': str, 'goal': (x,y)}}
+#     camera_blobs:  List[CameraBlob] = None,
+#     max_steps:     int   = 1500,
+#     dt:            float = 0.1,
+# ) -> Dict[str, List[Tuple[float, float, float]]]:
+#     """
+#     Run the full FleetManager pipeline and collect (x, y, yaw) histories.
 
-    Parameters
-    ----------
-    fleet        : configured FleetManager with robots already added + goals set
-    agent_data   : dict keyed by robot_id with 'color' and 'goal' fields
-    camera_blobs : static list of unknown obstacles (or None)
-    max_steps    : safety cutoff
-    dt           : must match fleet.cfg.sim_dt
+#     Parameters
+#     ----------
+#     fleet        : configured FleetManager with robots already added + goals set
+#     agent_data   : dict keyed by robot_id with 'color' and 'goal' fields
+#     camera_blobs : static list of unknown obstacles (or None)
+#     max_steps    : safety cutoff
+#     dt           : must match fleet.cfg.sim_dt
 
-    Returns
-    -------
-    histories : Dict[robot_id → list of (x, y, yaw)]
-    """
-    camera_blobs = camera_blobs or []
-    histories    = {rid: [] for rid in fleet.robots}
+#     Returns
+#     -------
+#     histories : Dict[robot_id → list of (x, y, yaw)]
+#     """
+#     camera_blobs = camera_blobs or []
+#     histories    = {rid: [] for rid in fleet.robots}
 
-    # Record initial positions
-    for rid, ctrl in fleet.robots.items():
-        p = ctrl.state.pose
-        histories[rid].append((p.x, p.y, p.yaw))
+#     # Record initial positions
+#     for rid, ctrl in fleet.robots.items():
+#         p = ctrl.state.pose
+#         histories[rid].append((p.x, p.y, p.yaw))
 
-    for step in range(max_steps):
-        # ── Run one pipeline tick ─────────────────────────────────────────
-        commands = fleet.tick_all(camera_blobs=camera_blobs)
+#     for step in range(max_steps):
+#         # ── Run one pipeline tick ─────────────────────────────────────────
+#         commands = fleet.tick_all(camera_blobs=camera_blobs)
 
-        all_reached = all(fleet.robots[rid].reached_goal for rid in fleet.robots)
+#         all_reached = all(fleet.robots[rid].reached_goal for rid in fleet.robots)
 
-        # ── Euler integration: propagate each robot's state ───────────────
-        for rid, cmd in commands.items():
-            ctrl = fleet.robots[rid]
-            p    = ctrl.state.pose
+#         # ── Euler integration: propagate each robot's state ───────────────
+#         for rid, cmd in commands.items():
+#             ctrl = fleet.robots[rid]
+#             p    = ctrl.state.pose
 
-            new_yaw = p.yaw + cmd.omega * dt
-            new_x   = p.x   + cmd.v * math.cos(new_yaw) * dt
-            new_y   = p.y   + cmd.v * math.sin(new_yaw) * dt
+#             new_yaw = p.yaw + cmd.omega * dt
+#             new_x   = p.x   + cmd.v * math.cos(new_yaw) * dt
+#             new_y   = p.y   + cmd.v * math.sin(new_yaw) * dt
 
-            # --- END OF run_simulation() LOOP ---
-            vx = cmd.v * math.cos(new_yaw)
-            vy = cmd.v * math.sin(new_yaw)
+#             # --- END OF run_simulation() LOOP ---
+#             vx = cmd.v * math.cos(new_yaw)
+#             vy = cmd.v * math.sin(new_yaw)
 
-            fleet.update_state(rid, new_x, new_y, new_yaw, vx, vy)
-            histories[rid].append((new_x, new_y, new_yaw))
+#             fleet.update_state(rid, new_x, new_y, new_yaw, vx, vy)
+#             histories[rid].append((new_x, new_y, new_yaw))
 
-        if all_reached:
-            print(f"All goals reached at step {step}.")
-            break
+#         if all_reached:
+#             print(f"All goals reached at step {step}.")
+#             break
 
-    return histories
+#     return histories
 
 
 
-def build_figure(
-    fleet:        FleetManager,
-    agent_data:   Dict,
-    global_paths: Dict,                   # robot_id → list of (x, y) or (x, y, θ)
-    histories:    Dict,
-    world_size:   float = 20.0,
-    static_circles: List = None,          # list of CircleObstacle
-    static_rects:   List = None,          # list of RectObstacle
-):
-    """
-    Build and return the (fig, ax, artists, update_fn) needed for FuncAnimation.
-    """
-    static_circles = static_circles or []
-    static_rects   = static_rects   or []
+# def build_figure(
+#     fleet:        FleetManager,
+#     agent_data:   Dict,
+#     global_paths: Dict,                   # robot_id → list of (x, y) or (x, y, θ)
+#     histories:    Dict,
+#     world_size:   float = 20.0,
+#     static_circles: List = None,          # list of CircleObstacle
+#     static_rects:   List = None,          # list of RectObstacle
+# ):
+#     """
+#     Build and return the (fig, ax, artists, update_fn) needed for FuncAnimation.
+#     """
+#     static_circles = static_circles or []
+#     static_rects   = static_rects   or []
 
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ax.set_xlim(0, world_size)
-    ax.set_ylim(0, world_size)
-    ax.set_aspect('equal')
-    ax.set_title('Multi-Agent Navigation: APF + NH-ORCA Pipeline', fontsize=14)
-    ax.set_xticks(np.arange(0, world_size + 1, 1))
-    ax.set_yticks(np.arange(0, world_size + 1, 1))
-    ax.grid(True, linestyle=':', alpha=0.5)
+#     fig, ax = plt.subplots(figsize=(10, 10))
+#     ax.set_xlim(0, world_size)
+#     ax.set_ylim(0, world_size)
+#     ax.set_aspect('equal')
+#     ax.set_title('Multi-Agent Navigation: APF + NH-ORCA Pipeline', fontsize=14)
+#     ax.set_xticks(np.arange(0, world_size + 1, 1))
+#     ax.set_yticks(np.arange(0, world_size + 1, 1))
+#     ax.grid(True, linestyle=':', alpha=0.5)
 
-    INFLATE = fleet.cfg.inflated_radius - fleet.cfg.robot_radius  # = ε
+#     INFLATE = fleet.cfg.inflated_radius - fleet.cfg.robot_radius  # = ε
 
-    # ── Static obstacles ──────────────────────────────────────────────────
-    for obs in static_circles:
-        ax.add_patch(Circle((obs.cx, obs.cy), obs.radius,
-                            fill=True, color='red', alpha=0.35, zorder=2))
-        ax.add_patch(Circle((obs.cx, obs.cy), obs.radius + INFLATE,
-                            fill=False, color='orange', linestyle='--',
-                            linewidth=1.2, zorder=2))
+#     # ── Static obstacles ──────────────────────────────────────────────────
+#     for obs in static_circles:
+#         ax.add_patch(Circle((obs.cx, obs.cy), obs.radius,
+#                             fill=True, color='red', alpha=0.35, zorder=2))
+#         ax.add_patch(Circle((obs.cx, obs.cy), obs.radius + INFLATE,
+#                             fill=False, color='orange', linestyle='--',
+#                             linewidth=1.2, zorder=2))
 
-    for obs in static_rects:
-        x0, y0, x1, y1 = obs.bounds
-        from matplotlib.patches import Rectangle
-        ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0,
-                     fill=True, color='red', alpha=0.35, zorder=2))
-        ax.add_patch(Rectangle((x0 - INFLATE, y0 - INFLATE),
-                     (x1 - x0) + 2 * INFLATE, (y1 - y0) + 2 * INFLATE,
-                     fill=False, color='orange', linestyle='--',
-                     linewidth=1.2, zorder=2))
+#     for obs in static_rects:
+#         x0, y0, x1, y1 = obs.bounds
+#         from matplotlib.patches import Rectangle
+#         ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0,
+#                      fill=True, color='red', alpha=0.35, zorder=2))
+#         ax.add_patch(Rectangle((x0 - INFLATE, y0 - INFLATE),
+#                      (x1 - x0) + 2 * INFLATE, (y1 - y0) + 2 * INFLATE,
+#                      fill=False, color='orange', linestyle='--',
+#                      linewidth=1.2, zorder=2))
 
-    # ── Boundary walls ─────────────────────────────────────────────────
-    # Four walls around the world perimeter — dark gray, solid
-    from matplotlib.patches import Rectangle as Rect2D
-    wall_color = 'dimgray'
-    wall_alpha = 0.6
-    W = 0.15  # wall thickness [m]
-    ax.add_patch(Rect2D((0, 0), W, world_size,
-                 fill=True, color=wall_color, alpha=wall_alpha, zorder=1))
-    ax.add_patch(Rect2D((world_size - W, 0), W, world_size,
-                 fill=True, color=wall_color, alpha=wall_alpha, zorder=1))
-    ax.add_patch(Rect2D((0, 0), world_size, W,
-                 fill=True, color=wall_color, alpha=wall_alpha, zorder=1))
-    ax.add_patch(Rect2D((0, world_size - W), world_size, W,
-                 fill=True, color=wall_color, alpha=wall_alpha, zorder=1))
+#     # ── Boundary walls ─────────────────────────────────────────────────
+#     # Four walls around the world perimeter — dark gray, solid
+#     from matplotlib.patches import Rectangle as Rect2D
+#     wall_color = 'dimgray'
+#     wall_alpha = 0.6
+#     W = 0.15  # wall thickness [m]
+#     ax.add_patch(Rect2D((0, 0), W, world_size,
+#                  fill=True, color=wall_color, alpha=wall_alpha, zorder=1))
+#     ax.add_patch(Rect2D((world_size - W, 0), W, world_size,
+#                  fill=True, color=wall_color, alpha=wall_alpha, zorder=1))
+#     ax.add_patch(Rect2D((0, 0), world_size, W,
+#                  fill=True, color=wall_color, alpha=wall_alpha, zorder=1))
+#     ax.add_patch(Rect2D((0, world_size - W), world_size, W,
+#                  fill=True, color=wall_color, alpha=wall_alpha, zorder=1))
 
-    # ── Global path lines (dashed) ────────────────────────────────────────
-    for rid, path in global_paths.items():
-        color = agent_data[rid]['color']
-        px = [p[0] for p in path]
-        py = [p[1] for p in path]
-        ax.plot(px, py, color=color, linestyle='--', linewidth=1.5,
-                alpha=0.4, zorder=1)
+#     # ── Global path lines (dashed) ────────────────────────────────────────
+#     for rid, path in global_paths.items():
+#         color = agent_data[rid]['color']
+#         px = [p[0] for p in path]
+#         py = [p[1] for p in path]
+#         ax.plot(px, py, color=color, linestyle='--', linewidth=1.5,
+#                 alpha=0.4, zorder=1)
 
-    # ── Goal markers ──────────────────────────────────────────────────────
-    for rid, data in agent_data.items():
-        gx, gy = data['goal']
-        color  = data['color']
-        ax.scatter(gx, gy, s=220, c=color, marker='*', zorder=5)
-    ax.annotate(f"Goal {rid}", (gx, gy),
-                 textcoords='offset points', xytext=(6, 6), fontsize=8)
+#     # ── Goal markers ──────────────────────────────────────────────────────
+#     for rid, data in agent_data.items():
+#         gx, gy = data['goal']
+#         color  = data['color']
+#         ax.scatter(gx, gy, s=220, c=color, marker='*', zorder=5)
+#     ax.annotate(f"Goal {rid}", (gx, gy),
+#                  textcoords='offset points', xytext=(6, 6), fontsize=8)
 
-    # ── Trajectory prediction lines ─────────────────────────────────────
-    # Show where each robot expects to go based on current velocity
-    traj_lines = {}
-    for rid in agent_data:
-        color = agent_data[rid]['color']
-        traj_lines[rid], = ax.plot([], [], color=color, linestyle=':',
-                                   linewidth=1.5, alpha=0.5, zorder=1)
+#     # ── Trajectory prediction lines ─────────────────────────────────────
+#     # Show where each robot expects to go based on current velocity
+#     traj_lines = {}
+#     for rid in agent_data:
+#         color = agent_data[rid]['color']
+#         traj_lines[rid], = ax.plot([], [], color=color, linestyle=':',
+#                                    linewidth=1.5, alpha=0.5, zorder=1)
 
-    # ── Yield indicator rings ────────────────────────────────────────────
-    # Yellow dashed ring around yielding robots
-    yield_rings = {}
-    for rid in agent_data:
-        x0, y0, _ = histories[rid][0]
-        yield_rings[rid] = Circle((x0, y0), r * 1.8, fill=False,
-                                  color='gold', linewidth=2.5,
-                                  linestyle='--', zorder=6, alpha=0.0)
-        ax.add_patch(yield_rings[rid])
+#     # ── Yield indicator rings ────────────────────────────────────────────
+#     # Yellow dashed ring around yielding robots
+#     yield_rings = {}
+#     for rid in agent_data:
+#         x0, y0, _ = histories[rid][0]
+#         yield_rings[rid] = Circle((x0, y0), r * 1.8, fill=False,
+#                                   color='gold', linewidth=2.5,
+#                                   linestyle='--', zorder=6, alpha=0.0)
+#         ax.add_patch(yield_rings[rid])
 
-    # ── Per-robot dynamic artists ─────────────────────────────────────────
-    r = fleet.cfg.robot_radius
-    L = fleet.cfg.wheel_base
+#     # ── Per-robot dynamic artists ─────────────────────────────────────────
+#     r = fleet.cfg.robot_radius
+#     L = fleet.cfg.wheel_base
 
-    body_patches  = {}
-    heading_lines = {}
-    trail_lines   = {}
-    left_wheels   = {}
-    right_wheels  = {}
+#     body_patches  = {}
+#     heading_lines = {}
+#     trail_lines   = {}
+#     left_wheels   = {}
+#     right_wheels  = {}
 
-    for rid, data in agent_data.items():
-        color = data['color']
-        x0, y0, _ = histories[rid][0]
+#     for rid, data in agent_data.items():
+#         color = data['color']
+#         x0, y0, _ = histories[rid][0]
 
-        body_patches[rid] = Circle((x0, y0), r, fill=True,
-                                   color=color, alpha=0.6, zorder=4)
-        ax.add_patch(body_patches[rid])
+#         body_patches[rid] = Circle((x0, y0), r, fill=True,
+#                                    color=color, alpha=0.6, zorder=4)
+#         ax.add_patch(body_patches[rid])
 
-        heading_lines[rid], = ax.plot([], [], color='black',
-                                      linewidth=2, zorder=5)
-        trail_lines[rid],   = ax.plot([], [], color=color,
-                                      linewidth=1.8, alpha=0.65, zorder=3)
-        left_wheels[rid],   = ax.plot([], [], color='black',
-                                      linewidth=4, solid_capstyle='round', zorder=5)
-        right_wheels[rid],  = ax.plot([], [], color='black',
-                                      linewidth=4, solid_capstyle='round', zorder=5)
+#         heading_lines[rid], = ax.plot([], [], color='black',
+#                                       linewidth=2, zorder=5)
+#         trail_lines[rid],   = ax.plot([], [], color=color,
+#                                       linewidth=1.8, alpha=0.65, zorder=3)
+#         left_wheels[rid],   = ax.plot([], [], color='black',
+#                                       linewidth=4, solid_capstyle='round', zorder=5)
+#         right_wheels[rid],  = ax.plot([], [], color='black',
+#                                       linewidth=4, solid_capstyle='round', zorder=5)
 
-    # ── Social bubble rings ───────────────────────────────────────────
-    # Dashed circle showing the 20% virtual clearance zone
-    social_r = fleet.cfg.robot_radius * (1.0 + fleet.cfg.social_bubble_factor)
-    bubble_patches = {}
-    for rid, data in agent_data.items():
-        color = data['color']
-        x0, y0, _ = histories[rid][0]
-        bubble_patches[rid] = Circle(
-            (x0, y0), social_r, fill=False, color=color, linewidth=1.5,
-            linestyle='--', alpha=0.45, zorder=3
-        )
-        ax.add_patch(bubble_patches[rid])
+#     # ── Social bubble rings ───────────────────────────────────────────
+#     # Dashed circle showing the 20% virtual clearance zone
+#     social_r = fleet.cfg.robot_radius * (1.0 + fleet.cfg.social_bubble_factor)
+#     bubble_patches = {}
+#     for rid, data in agent_data.items():
+#         color = data['color']
+#         x0, y0, _ = histories[rid][0]
+#         bubble_patches[rid] = Circle(
+#             (x0, y0), social_r, fill=False, color=color, linewidth=1.5,
+#             linestyle='--', alpha=0.45, zorder=3
+#         )
+#         ax.add_patch(bubble_patches[rid])
 
-    # ── Velocity arrows (V_path white, V_pref blue, V_safe green) ─────
-    # Arrows scaled so max_speed → arrow length of 0.2 world units
-    # scale_units='width' means U is in data units of x-axis width
-    _ARROW_SCALE = 10.0 # max_speed / _ARROW_SCALE = visual arrow length
-    v_path_quivers = {}
-    v_pref_quivers = {}
-    v_safe_quivers = {}
-    for rid, data in agent_data.items():
-        color = data['color']
-        x0, y0, _ = histories[rid][0]
-        # V_path arrow (white, shortest — raw intent)
-        v_path_quivers[rid] = ax.quiver(
-            x0, y0, 0.01, 0.01, color='white', scale=_ARROW_SCALE,
-            width=0.004, alpha=0.9, zorder=7, pivot='mid'
-        )
-        # V_pref arrow (dodgerblue, medium — APF-blended intent)
-        v_pref_quivers[rid] = ax.quiver(
-            x0, y0, 0.01, 0.01, color='dodgerblue', scale=_ARROW_SCALE,
-            width=0.005, alpha=0.9, zorder=7, pivot='mid'
-        )
-        # V_safe arrow (limegreen, shortest — ORCA-corrected intent)
-        v_safe_quivers[rid] = ax.quiver(
-            x0, y0, 0.01, 0.01, color='limegreen', scale=_ARROW_SCALE,
-            width=0.006, alpha=0.9, zorder=7, pivot='mid'
-        )
+#     # ── Velocity arrows (V_path white, V_pref blue, V_safe green) ─────
+#     # Arrows scaled so max_speed → arrow length of 0.2 world units
+#     # scale_units='width' means U is in data units of x-axis width
+#     _ARROW_SCALE = 10.0 # max_speed / _ARROW_SCALE = visual arrow length
+#     v_path_quivers = {}
+#     v_pref_quivers = {}
+#     v_safe_quivers = {}
+#     for rid, data in agent_data.items():
+#         color = data['color']
+#         x0, y0, _ = histories[rid][0]
+#         # V_path arrow (white, shortest — raw intent)
+#         v_path_quivers[rid] = ax.quiver(
+#             x0, y0, 0.01, 0.01, color='white', scale=_ARROW_SCALE,
+#             width=0.004, alpha=0.9, zorder=7, pivot='mid'
+#         )
+#         # V_pref arrow (dodgerblue, medium — APF-blended intent)
+#         v_pref_quivers[rid] = ax.quiver(
+#             x0, y0, 0.01, 0.01, color='dodgerblue', scale=_ARROW_SCALE,
+#             width=0.005, alpha=0.9, zorder=7, pivot='mid'
+#         )
+#         # V_safe arrow (limegreen, shortest — ORCA-corrected intent)
+#         v_safe_quivers[rid] = ax.quiver(
+#             x0, y0, 0.01, 0.01, color='limegreen', scale=_ARROW_SCALE,
+#             width=0.006, alpha=0.9, zorder=7, pivot='mid'
+#         )
 
-    # ── Step counter text ─────────────────────────────────────────────────
-    step_text = ax.text(0.02, 0.97, '', transform=ax.transAxes,
-                        fontsize=10, verticalalignment='top')
+#     # ── Step counter text ─────────────────────────────────────────────────
+#     step_text = ax.text(0.02, 0.97, '', transform=ax.transAxes,
+#                         fontsize=10, verticalalignment='top')
 
-    # ── Update function ───────────────────────────────────────────────────
-    wl = L * 0.6          # visual wheel length
+#     # ── Update function ───────────────────────────────────────────────────
+#     wl = L * 0.6          # visual wheel length
 
-    def update(frame):
-        artists = [step_text]
-        step_text.set_text(f'Step: {frame}')
+#     def update(frame):
+#         artists = [step_text]
+#         step_text.set_text(f'Step: {frame}')
 
-        for rid in agent_data:
-            hist = histories[rid]
-            f    = min(frame, len(hist) - 1)
-            x, y, theta = hist[f]
+#         for rid in agent_data:
+#             hist = histories[rid]
+#             f    = min(frame, len(hist) - 1)
+#             x, y, theta = hist[f]
 
-            # Trail
-            trail_lines[rid].set_data(
-                [p[0] for p in hist[:f + 1]],
-                [p[1] for p in hist[:f + 1]]
-            )
+#             # Trail
+#             trail_lines[rid].set_data(
+#                 [p[0] for p in hist[:f + 1]],
+#                 [p[1] for p in hist[:f + 1]]
+#             )
 
-            # Body
-            body_patches[rid].center = (x, y)
+#             # Body
+#             body_patches[rid].center = (x, y)
 
-            # Heading arrow (centre → nose)
-            heading_lines[rid].set_data(
-                [x, x + r * math.cos(theta)],
-                [y, y + r * math.sin(theta)]
-            )
+#             # Heading arrow (centre → nose)
+#             heading_lines[rid].set_data(
+#                 [x, x + r * math.cos(theta)],
+#                 [y, y + r * math.sin(theta)]
+#             )
 
-        # Wheel positions (perpendicular to heading)
-        # Left wheel centre
-        lx = x - (L / 2) * math.sin(theta)
-        ly = y + (L / 2) * math.cos(theta)
-        # Right wheel centre
-        rx = x + (L / 2) * math.sin(theta)
-        ry = y - (L / 2) * math.cos(theta)
+#         # Wheel positions (perpendicular to heading)
+#         # Left wheel centre
+#         lx = x - (L / 2) * math.sin(theta)
+#         ly = y + (L / 2) * math.cos(theta)
+#         # Right wheel centre
+#         rx = x + (L / 2) * math.sin(theta)
+#         ry = y - (L / 2) * math.cos(theta)
 
-        # Draw each wheel as a short line along heading direction
-        left_wheels[rid].set_data(
-            [lx - wl * math.cos(theta), lx + wl * math.cos(theta)],
-            [ly - wl * math.sin(theta), ly + wl * math.sin(theta)]
-        )
-        right_wheels[rid].set_data(
-            [rx - wl * math.cos(theta), rx + wl * math.cos(theta)],
-            [ry - wl * math.sin(theta), ry + wl * math.sin(theta)]
-        )
+#         # Draw each wheel as a short line along heading direction
+#         left_wheels[rid].set_data(
+#             [lx - wl * math.cos(theta), lx + wl * math.cos(theta)],
+#             [ly - wl * math.sin(theta), ly + wl * math.sin(theta)]
+#         )
+#         right_wheels[rid].set_data(
+#             [rx - wl * math.cos(theta), rx + wl * math.cos(theta)],
+#             [ry - wl * math.sin(theta), ry + wl * math.sin(theta)]
+#         )
 
-        # ── Trajectory prediction ─────────────────────────────────────────
-        ctrl = fleet.robots[rid]
-        vel = ctrl.state.vel
-        tau_viz = 3.0  # predict 3 seconds ahead
-        traj_pts = [(x, y)]
-        for t in np.linspace(0, tau_viz, 20):
-            traj_pts.append((x + vel[0] * t, y + vel[1] * t))
-        traj_lines[rid].set_data([p[0] for p in traj_pts], [p[1] for p in traj_pts])
+#         # ── Trajectory prediction ─────────────────────────────────────────
+#         ctrl = fleet.robots[rid]
+#         vel = ctrl.state.vel
+#         tau_viz = 3.0  # predict 3 seconds ahead
+#         traj_pts = [(x, y)]
+#         for t in np.linspace(0, tau_viz, 20):
+#             traj_pts.append((x + vel[0] * t, y + vel[1] * t))
+#         traj_lines[rid].set_data([p[0] for p in traj_pts], [p[1] for p in traj_pts])
 
-        # ── Yield indicator ring ───────────────────────────────────────────
-        if ctrl.is_yielding:
-            yield_rings[rid].center = (x, y)
-            yield_rings[rid].set_alpha(0.9)
-        else:
-            yield_rings[rid].set_alpha(0.0)
+#         # ── Yield indicator ring ───────────────────────────────────────────
+#         if ctrl.is_yielding:
+#             yield_rings[rid].center = (x, y)
+#             yield_rings[rid].set_alpha(0.9)
+#         else:
+#             yield_rings[rid].set_alpha(0.0)
 
-        # ── Social bubble patch ─────────────────────────────────────────
-        bubble_patches[rid].center = (x, y)
+#         # ── Social bubble patch ─────────────────────────────────────────
+#         bubble_patches[rid].center = (x, y)
 
-        # ── Velocity arrows (V_path white, V_pref blue, V_safe green) ──
-        debug = ctrl.get_debug_info()
-        v_path = debug['v_path']
-        v_pref = debug['v_pref']
-        v_safe = debug['v_safe']
-        v_path_quivers[rid].set_UVC(v_path[0], v_path[1])
-        v_path_quivers[rid].set_offsets(np.array([[x, y]]))
-        v_pref_quivers[rid].set_UVC(v_pref[0], v_pref[1])
-        v_pref_quivers[rid].set_offsets(np.array([[x, y]]))
-        v_safe_quivers[rid].set_UVC(v_safe[0], v_safe[1])
-        v_safe_quivers[rid].set_offsets(np.array([[x, y]]))
+#         # ── Velocity arrows (V_path white, V_pref blue, V_safe green) ──
+#         debug = ctrl.get_debug_info()
+#         v_path = debug['v_path']
+#         v_pref = debug['v_pref']
+#         v_safe = debug['v_safe']
+#         v_path_quivers[rid].set_UVC(v_path[0], v_path[1])
+#         v_path_quivers[rid].set_offsets(np.array([[x, y]]))
+#         v_pref_quivers[rid].set_UVC(v_pref[0], v_pref[1])
+#         v_pref_quivers[rid].set_offsets(np.array([[x, y]]))
+#         v_safe_quivers[rid].set_UVC(v_safe[0], v_safe[1])
+#         v_safe_quivers[rid].set_offsets(np.array([[x, y]]))
 
-        artists.extend([
-            trail_lines[rid], body_patches[rid],
-            heading_lines[rid], left_wheels[rid], right_wheels[rid],
-            traj_lines[rid], yield_rings[rid],
-            bubble_patches[rid],
-            v_path_quivers[rid], v_pref_quivers[rid], v_safe_quivers[rid],
-        ])
+#         artists.extend([
+#             trail_lines[rid], body_patches[rid],
+#             heading_lines[rid], left_wheels[rid], right_wheels[rid],
+#             traj_lines[rid], yield_rings[rid],
+#             bubble_patches[rid],
+#             v_path_quivers[rid], v_pref_quivers[rid], v_safe_quivers[rid],
+#         ])
 
-        return artists
+#         return artists
 
-    return fig, update, max(len(h) for h in histories.values())
+#     return fig, update, max(len(h) for h in histories.values())

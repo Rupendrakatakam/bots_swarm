@@ -241,22 +241,56 @@ def build_figure(fleet, agent_data, global_paths, histories,
 
 if __name__ == '__main__':
 
-    # ── 1. Config ──────────────────────────────────────────────────────────
+    # =======================================================================
+    # 1. CENTRAL TUNING PANEL
+    # =======================================================================
+    # Tune these parameters to adjust the swarm's behavior.
+    
+    # --- A. Differential Drive & Physical Limits ---
     cfg = DiffDriveConfig(
-        robot_radius        = 1.0,
-        wheel_base          = 0.8,
-        max_linear_speed    = 2.0,
-        max_angular_speed   = 5.0,
-        max_wheel_speed     = 3.0,
-        max_linear_accel    = 2.0,
-        max_linear_decel    = 3.0,
-        max_angular_accel   = 4.0,
-        tracking_error      = 0.30,    # was 0.50 — reduces social_radius from 1.7 to 1.5, fewer premature yields
-        orientation_time    = 0.8,     # was 1.2 — faster rotation for escape maneuvers
-        time_horizon        = 3.0,
-        neighbor_dist       = 6.0,
-        sim_dt              = 0.1,
+        robot_radius      = 1.0,  # [m] Physical radius. Increase: larger safety zones, harder to fit in gaps.
+        wheel_base        = 0.8,  # [m] Distance between wheels.
+        max_linear_speed  = 2.0,  # [m/s] Max forward speed. Increase: faster arrival. Decrease: safer navigation.
+        max_angular_speed = 5.0,  # [rad/s] Max spin. Increase: snappier turns. Decrease: wider, smoother turns.
+        max_wheel_speed   = 3.0,  # [m/s] Physical motor limit. Couples linear/angular speeds.
+        max_linear_accel  = 2.0,  # [m/s²] Motor acceleration. Increase: reaches top speed faster.
+        max_linear_decel  = 3.0,  # [m/s²] Motor braking. Increase: harder stops. Decrease: glides longer.
+        max_angular_accel = 4.0,  # [rad/s²] Spin acceleration. 
+        tracking_error    = 0.25, # [m] Swarm social bubble (ORCA). Decrease: robots pass closer. Increase: yields earlier.
+        orientation_time  = 1.0,  # [s] Heading correction time. Decrease: faster response. Increase: smoother rotation.
+        time_horizon      = 3.0,  # [s] ORCA prediction. Increase: dodges swarm earlier, but path deflects more.
+        neighbor_dist     = 6.0,  # [m] Swarm sensing range. Increase: coordinates with distant robots.
+        sim_dt            = 0.1,  # [s] 10Hz control loop.
     )
+
+    # --- B. Artificial Potential Field (APF) - Emergency Avoidance ---
+    # Controls how the robot dodges unknown camera blobs and static walls.
+    p = ImprovedAPFParams(
+        k_att        = 1.9,   # Pull to A* path. Increase: sticks tighter to path. Decrease: easily pushed off path.
+        eta          = 14.0,  # Repulsion strength. Increase: harder push away. Decrease: softer course corrections.
+        rho_0        = 3.0,   # [m] Repulsion zone. Increase: starts dodging earlier. Decrease: ignores obstacles until close.
+        max_force    = 12.0,  # Force ceiling. Increase: allows violent jerks to escape. Decrease: caps force for smoothness.
+        vortex_gain  = 0.15,  # Tangential sliding. Increase: slides perpendicularly around blobs. Decrease: less jitter.
+        robot_radius = cfg.robot_radius,
+        
+        # GNRO and Local Minima Escape (Eq. 4-6)
+        n_reg        = 0.5,   # GNRO regulation. Adjusts repulsion curve shape near goal.
+        step_length  = 0.2,   # Normal step size expected.
+        beta_stuck   = 3.0,   # Stuck detection threshold. Decrease: detects local minima faster.
+        stuck_window = 8,     # Ticks to declare stuck. Decrease: breaks out of local minima sooner.
+        beta1        = 2.0,   # Virtual target X amplitude. Increase: wider escape arcs.
+        beta2        = 2.0,   # Virtual target Y amplitude. Increase: wider escape arcs.
+        n_vt         = 1.0,   # Escape oscillation frequency.
+        virtual_target_duration = 20, # [ticks] Time to chase virtual target.
+    )
+
+    # --- C. Path Following & Smoothing ---
+    FILTER_ALPHA     = 0.5  # Final velocity command EMA smoothing. Decrease: smoother commands but more lag.
+    GOAL_TOLERANCE   = 0.5   # [m] Goal reach radius. Increase: finishes earlier if A* waypoints are sparse.
+    LOOKAHEAD_WINDOW = 25    # A* waypoints to scan. Increase: recovers from large detours better.
+    CARROT_STEPS     = 10    # Target waypoint index offset. Increase: smoother following, cuts corners more.
+
+    # =======================================================================
 
     # ── 2. Obstacles ───────────────────────────────────────────────────────
     # Internal static obstacles for A* path planning AND APF emergency backup
@@ -272,24 +306,6 @@ if __name__ == '__main__':
     ]
     ALL_RECTS_FOR_ASTAR = INTERNAL_RECTS + BOUNDARY_RECTS
 
-# APF: static obstacles for EMERGENCY LOCAL AVOIDANCE (when blob pushes robot toward them)
-# Using ImprovedAPF with GNRO fix (Eq.1-3) + LocalMinimaState (Eq.4-6)
-    p = ImprovedAPFParams(
-        k_att=1.9,
-        eta=18.0,          # was 12.0 — stronger repulsion for faster-moving blobs
-        rho_0=4.0,         # was 2.5 — earlier detection (surface gap 4m triggers APF)
-        max_force=18.0,    # was 12.0 — higher force ceiling before clamping
-        vortex_gain=0.4,   # was 0.3 — stronger tangential sliding around blobs
-        robot_radius=cfg.robot_radius,
-        n_reg=0.5,         # regulation constant n (0 < n < 1)
-        step_length=0.2,   # normal step size l (Eq.4)
-        beta_stuck=3.0,    # stuck threshold β (Eq.4)
-        stuck_window=8,    # consecutive slow steps = stuck
-        beta1=2.0,         # virtual target x-amplitude β₁ (Eq.5)
-        beta2=2.0,         # virtual target y-amplitude β₂ (Eq.6)
-        n_vt=1.0,          # oscillation frequency (Eq.5-6)
-        virtual_target_duration=20,  # ticks to chase virtual target
-    )
     apf = ImprovedAPF(
         p,
         static_circles=INTERNAL_CIRCLES,
@@ -311,10 +327,10 @@ if __name__ == '__main__':
     for rid, data in agent_data.items():
         robot = fleet.add_robot(
             rid,
-            filter_alpha     = 1.0, # for smoothing the velocity commands
-            goal_tolerance = 1.0, # A* last waypoint is ~1m from goal, need tolerance > path precision
-            lookahead_window = 30,   # wider scan — better for sparse A* paths
-            carrot_steps     = 10,    # further carrot — smoother following in large world
+            filter_alpha     = FILTER_ALPHA,
+            goal_tolerance   = GOAL_TOLERANCE,
+            lookahead_window = LOOKAHEAD_WINDOW,
+            carrot_steps     = CARROT_STEPS,
         )
         sx, sy, stheta = data['start']
         gx, gy = data['goal']
