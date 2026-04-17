@@ -430,6 +430,25 @@ class WaypointTracker:
         closest_local = int(np.argmin(dists))
         self._current_idx = lo + closest_local
 
+        # ── Global reset: if robot drifted far from window, resync ───
+        # This happens when ORCA deflects the robot far off the A* path.
+        # Without this, the scan window falls behind and V_path becomes stale.
+        DRIFT_THRESHOLD = self.max_speed * 4.0 # 4 s of travel = serious drift
+        min_window_dist = dists[closest_local]
+        if min_window_dist > DRIFT_THRESHOLD and self._current_idx > 0:
+            # Robot is very far from any waypoint in the current window.
+            # Do a global search across the full path to resync.
+            all_dists = [np.linalg.norm(robot_pos - wps[i]) for i in range(n_wp)]
+            global_best = int(np.argmin(all_dists))
+            # Only go forward, never backward (prevents looping)
+            if global_best > self._current_idx:
+                self._current_idx = global_best
+                # Recompute window from new position
+                hi = min(self._current_idx + self.lookahead_window, n_wp)
+                dists = [np.linalg.norm(robot_pos - wps[i]) for i in range(self._current_idx, hi)]
+                closest_local = int(np.argmin(dists))
+                self._current_idx = self._current_idx + closest_local
+
         carrot_idx = min(self._current_idx + self.carrot_steps, n_wp - 1)
         carrot = wps[carrot_idx]
         self._last_carrot = carrot.copy()
@@ -653,6 +672,21 @@ class MotorMapper:
         )
         v_target = min(v_target, v_coupled_limit)
 
+        # ── Turn-aware speed: sharp turns → slow down (human behavior) ───
+        # When the steering wheel is turned sharply, humans brake before the
+        # turn, then accelerate through it. We detect this via omega_target
+        # magnitude and apply a proportional speed reduction.
+        # omega_target > 0.5 * max_angular_speed → entering sharp turn
+        TURN_SLOW_THRESHOLD = 0.5 * cfg.max_angular_speed
+        if abs(omega_target) > TURN_SLOW_THRESHOLD:
+            # Map [0.5*w_max, w_max] → [0.60, 1.0] speed factor
+            # At threshold (0.5*w_max) → 60% speed retained
+            # At max (1.0*w_max) → 60% speed retained
+            # (Linear from threshold to max, constant beyond)
+            turn_sharpness = (abs(omega_target) - TURN_SLOW_THRESHOLD) / (0.5 * cfg.max_angular_speed)
+            turn_slow_factor = max(0.60, 1.0 - turn_sharpness * 0.40)
+            v_target *= turn_slow_factor
+
         # ── Acceleration limits (smooth transitions) ──────────────────────
         dv = v_target - state.prev_v
         if dv >= 0:
@@ -685,9 +719,6 @@ class MotorMapper:
         return WheelCommand(v=v_act, omega=w_act, vl=vl, vr=vr)
 
 
-    # ─────────────────────────────────────────────────────────────────────────────
-    # EMERGENCY BRAKE — hard geometric safety net
-    # ─────────────────────────────────────────────────────────────────────────────
 # EMERGENCY BRAKE — hard geometric safety net
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1561,6 +1592,45 @@ def build_figure(
         right_wheels[rid],  = ax.plot([], [], color='black',
                                       linewidth=4, solid_capstyle='round', zorder=5)
 
+    # ── Social bubble rings ───────────────────────────────────────────
+    # Dashed circle showing the 20% virtual clearance zone
+    social_r = fleet.cfg.robot_radius * (1.0 + fleet.cfg.social_bubble_factor)
+    bubble_patches = {}
+    for rid, data in agent_data.items():
+        color = data['color']
+        x0, y0, _ = histories[rid][0]
+        bubble_patches[rid] = Circle(
+            (x0, y0), social_r, fill=False, color=color, linewidth=1.5,
+            linestyle='--', alpha=0.45, zorder=3
+        )
+        ax.add_patch(bubble_patches[rid])
+
+    # ── Velocity arrows (V_path white, V_pref blue, V_safe green) ─────
+    # Arrows scaled so max_speed → arrow length of 0.2 world units
+    # scale_units='width' means U is in data units of x-axis width
+    _ARROW_SCALE = 10.0 # max_speed / _ARROW_SCALE = visual arrow length
+    v_path_quivers = {}
+    v_pref_quivers = {}
+    v_safe_quivers = {}
+    for rid, data in agent_data.items():
+        color = data['color']
+        x0, y0, _ = histories[rid][0]
+        # V_path arrow (white, shortest — raw intent)
+        v_path_quivers[rid] = ax.quiver(
+            x0, y0, 0.01, 0.01, color='white', scale=_ARROW_SCALE,
+            width=0.004, alpha=0.9, zorder=7, pivot='mid'
+        )
+        # V_pref arrow (dodgerblue, medium — APF-blended intent)
+        v_pref_quivers[rid] = ax.quiver(
+            x0, y0, 0.01, 0.01, color='dodgerblue', scale=_ARROW_SCALE,
+            width=0.005, alpha=0.9, zorder=7, pivot='mid'
+        )
+        # V_safe arrow (limegreen, shortest — ORCA-corrected intent)
+        v_safe_quivers[rid] = ax.quiver(
+            x0, y0, 0.01, 0.01, color='limegreen', scale=_ARROW_SCALE,
+            width=0.006, alpha=0.9, zorder=7, pivot='mid'
+        )
+
     # ── Step counter text ─────────────────────────────────────────────────
     step_text = ax.text(0.02, 0.97, '', transform=ax.transAxes,
                         fontsize=10, verticalalignment='top')
@@ -1626,10 +1696,27 @@ def build_figure(
         else:
             yield_rings[rid].set_alpha(0.0)
 
+        # ── Social bubble patch ─────────────────────────────────────────
+        bubble_patches[rid].center = (x, y)
+
+        # ── Velocity arrows (V_path white, V_pref blue, V_safe green) ──
+        debug = ctrl.get_debug_info()
+        v_path = debug['v_path']
+        v_pref = debug['v_pref']
+        v_safe = debug['v_safe']
+        v_path_quivers[rid].set_UVC(v_path[0], v_path[1])
+        v_path_quivers[rid].set_offsets(np.array([[x, y]]))
+        v_pref_quivers[rid].set_UVC(v_pref[0], v_pref[1])
+        v_pref_quivers[rid].set_offsets(np.array([[x, y]]))
+        v_safe_quivers[rid].set_UVC(v_safe[0], v_safe[1])
+        v_safe_quivers[rid].set_offsets(np.array([[x, y]]))
+
         artists.extend([
             trail_lines[rid], body_patches[rid],
             heading_lines[rid], left_wheels[rid], right_wheels[rid],
-            traj_lines[rid], yield_rings[rid]
+            traj_lines[rid], yield_rings[rid],
+            bubble_patches[rid],
+            v_path_quivers[rid], v_pref_quivers[rid], v_safe_quivers[rid],
         ])
 
         return artists
