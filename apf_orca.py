@@ -85,12 +85,15 @@ class RobotState:
 class CameraBlob:
     """
     One unknown obstacle detection from the overhead camera.
-    Only position and estimated size — no velocity.
+    Position, estimated size, and velocity estimate for prediction.
     """
     x:      float
     y:      float
     radius: float   = 0.30   # estimated bounding radius [m]
     priority: float = 1.0    # repulsion multiplier (1.0 = normal)
+    # Velocity estimate (filled by simulation, estimated from camera in real system)
+    vx: float = 0.0
+    vy: float = 0.0
 
 
 @dataclass
@@ -517,16 +520,26 @@ class IntentionBlender:
 
     def compute(
         self,
-        robot_pos: Tuple[float, float],
-        v_path: np.ndarray, # from waypoint tracker
-        camera_blobs: List[CameraBlob], # UNKNOWN obstacles ONLY
-        goal_pos: Optional[Tuple[float, float]] = None, # carrot waypoint for ImprovedAPF rho_g
-    ) -> np.ndarray: # V_pref [vx, vy]
+        robot_pos:    Tuple[float, float],
+        v_path:       np.ndarray,
+        camera_blobs: List[CameraBlob],
+        goal_pos:     Optional[Tuple[float, float]] = None,
+    ) -> np.ndarray:
         """
         Blend the path velocity with APF repulsion from camera blobs.
 
-        EMERGENCY: if repulsion magnitude > 2x max_pref_speed, ignore path
-        and output pure repulsion direction to prevent collision.
+        THREE RESPONSE ZONES
+        --------------------
+        Zone 1 — Normal blend: robot far from all blobs.
+                  V_pref = path + repulsion.
+
+        Zone 2 — Repulsion dominant: APF force > 1× max_speed.
+                  Ignore path completely, output pure repulsion.
+                  (Previously 2× — too permissive, path dragged robot INTO obstacle.)
+
+        Zone 3 — Emergency overlap: surface gap ≤ 0 → robot INSIDE blob.
+                  Output pure repulsion regardless of APF magnitude.
+                  This is the case that caused the visualised collision.
         """
         if not camera_blobs:
             spd = np.linalg.norm(v_path)
@@ -534,38 +547,47 @@ class IntentionBlender:
                 return v_path * (self.max_pref_speed / spd)
             return v_path.copy()
 
-        # Build DynamicObstacle list from camera blobs
-        dyn_obs = [
-            DynamicObstacle(b.x, b.y, b.radius, b.priority)
-            for b in camera_blobs
-        ]
+        dyn_obs = [DynamicObstacle(b.x, b.y, b.radius, b.priority)
+                   for b in camera_blobs]
+        F_unknown = self.apf.get_repulsive_only(
+            robot_pos, dyn_obs, goal_pos=goal_pos, robot_id=self.robot_id
+        )
+        f_mag = float(np.linalg.norm(F_unknown))
 
-        # APF returns ONLY the repulsive component
-        # (the attractive pull is handled by the waypoint tracker above)
-        # goal_pos enables ImprovedAPF's GNRO fix (rho_g calculation). If None,
-        # ImprovedAPF silently falls back to classical behaviour.
-        # robot_id enables per-robot LocalMinimaState tracking.
-        F_unknown = self.apf.get_repulsive_only(robot_pos, dyn_obs, goal_pos=goal_pos, robot_id=self.robot_id)
+        # ── Find minimum surface gap to any blob ──────────────────────────
+        robot_r = self.apf.p.robot_radius
+        min_gap = float('inf')
+        for b in camera_blobs:
+            diff        = np.array([b.x, b.y]) - np.array(robot_pos)
+            centre_dist = float(np.linalg.norm(diff))
+            gap         = centre_dist - b.radius - robot_r
+            min_gap     = min(min_gap, gap)
 
-        f_mag = np.linalg.norm(F_unknown)
+        # ── Zone 3: already overlapping — path is irrelevant ──────────────
+        if min_gap <= 0.0:
+            if f_mag > 1e-6:
+                return (F_unknown / f_mag) * self.max_pref_speed
+            # APF returned zero (degenerate) — push outward from nearest blob
+            nearest_dir = np.zeros(2)
+            nearest_dist = float('inf')
+            for b in camera_blobs:
+                diff = np.array(robot_pos) - np.array([b.x, b.y])
+                d    = float(np.linalg.norm(diff))
+                if d < nearest_dist:
+                    nearest_dist = d
+                    nearest_dir  = diff / max(d, 1e-9)
+            return nearest_dir * self.max_pref_speed
 
-        # ── Emergency: repulsion very strong — ignore path ────────────────
-        # Do NOT let path attraction cancel emergency repulsion.
-        # If repulsion magnitude > emergency threshold, ignore path and
-        # output pure repulsion at max speed.
-        EMERGENCY_THRESHOLD = self.max_pref_speed * 2.0  # > 1x max_speed = emergency
+        # ── Zone 2: repulsion exceeds threshold — override path ───────────
+        EMERGENCY_THRESHOLD = self.max_pref_speed * 1.0  # was 2.0 — too permissive
         if f_mag > EMERGENCY_THRESHOLD:
-            repulsion_dir = F_unknown / f_mag
-            return repulsion_dir * self.max_pref_speed
+            return (F_unknown / f_mag) * self.max_pref_speed
 
-        # ── Normal blend: path + repulsion ────────────────────────────────
+        # ── Zone 1: normal blend ──────────────────────────────────────────
         V_pref = v_path + F_unknown
-
-        # Clip to max preferred speed
-        speed = np.linalg.norm(V_pref)
+        speed  = float(np.linalg.norm(V_pref))
         if speed > self.max_pref_speed:
             V_pref = V_pref * (self.max_pref_speed / speed)
-
         return V_pref
 
 
@@ -605,7 +627,7 @@ class MotorMapper:
         self.cfg = cfg
         self.alpha = filter_alpha
         self._prev_heading_error = 0.0
-        self.heading_alpha = 0.3 # EMA smoothing for heading
+        self.heading_alpha = 0.5 # EMA smoothing for heading (was 0.3 — faster response for escape)
 
     def compute(
         self,
@@ -741,127 +763,123 @@ class EmergencyBrake:
     def __init__(
         self,
         robot_radius: float = 1.0,
-        warn_dist: float = 0.8, # gap: slow down
-        brake_dist: float = 0.3, # gap: hard brake
-        reverse_dist: float = 0.0, # gap: reverse (≤0 = overlapping)
-        slow_factor: float = 0.4, # fraction of max speed in warning
-        reverse_speed: float = 0.3, # [m/s] reverse speed
+        warn_dist: float = 0.8,        # gap: slow down
+        brake_dist: float = 0.3,       # gap: hard brake
+        reverse_dist: float = 0.0,     # gap: reverse (≤0 = overlapping)
+        slow_factor: float = 0.4,      # fraction of max speed in warning
+        reverse_speed: float = 0.3,    # [m/s] reverse speed
         world_x_min: float = 0.0,
         world_x_max: float = 20.0,
         world_y_min: float = 0.0,
         world_y_max: float = 20.0,
+        max_angular_speed: float = 5.0,  # for escape rotation during brake
     ):
-        self.robot_radius = robot_radius
-        self.warn_dist = warn_dist
-        self.brake_dist = brake_dist
-        self.reverse_dist = reverse_dist
-        self.slow_factor = slow_factor
-        self.reverse_speed = reverse_speed
-        self.world_x_min = world_x_min
-        self.world_x_max = world_x_max
-        self.world_y_min = world_y_min
-        self.world_y_max = world_y_max
+        self.robot_radius      = robot_radius
+        self.warn_dist         = warn_dist
+        self.brake_dist        = brake_dist
+        self.reverse_dist      = reverse_dist
+        self.slow_factor       = slow_factor
+        self.reverse_speed     = reverse_speed
+        self.world_x_min       = world_x_min
+        self.world_x_max       = world_x_max
+        self.world_y_min       = world_y_min
+        self.world_y_max       = world_y_max
+        self.cfg_max_angular   = max_angular_speed
 
     def check(
         self,
-        cmd: WheelCommand,
-        robot_pos: np.ndarray,
-        robot_yaw: float,
+        cmd:          WheelCommand,
+        robot_pos:    np.ndarray,
+        robot_yaw:    float,
         camera_blobs: List[CameraBlob],
+        dt:           float = 0.1,         # sim_dt — for velocity prediction
+        lookahead:    int   = 3,           # ticks to predict ahead
     ) -> WheelCommand:
-        """Inspect cmd against immediate geometry and override if unsafe."""
-        # ── Check blob obstacles ──────────────────────────────────────────
-        min_blob_gap = float('inf')
-        closest_blob_dir = None
+        """
+        Geometric safety override with predictive lookahead.
+
+        CHANGES from previous version:
+        - Predicts blob position up to `lookahead` ticks ahead using blob velocity.
+        - Level 3 (reverse) triggers on gap ≤ 0 REGARDLESS of heading direction.
+          (Old heading check allowed robots to sit inside blobs.)
+        - Checks BOTH current AND predicted positions (worst case wins).
+        """
+        min_gap     = float('inf')
+        closest_dir = None
 
         for blob in camera_blobs:
-            blob_pos = np.array([blob.x, blob.y])
-            centre_dist = np.linalg.norm(robot_pos - blob_pos)
-            gap = centre_dist - blob.radius - self.robot_radius
+            # ── Check current AND predicted blob positions ─────────────────
+            for step in range(lookahead + 1):
+                t        = step * dt
+                bx_pred  = blob.x  + blob.vx * t
+                by_pred  = blob.y  + blob.vy * t
+                blob_pos = np.array([bx_pred, by_pred])
 
-            if gap < min_blob_gap:
-                min_blob_gap = gap
-                if centre_dist > 1e-9:
-                    closest_blob_dir = (robot_pos - blob_pos) / centre_dist
+                centre_dist = float(np.linalg.norm(robot_pos - blob_pos))
+                gap         = centre_dist - blob.radius - self.robot_radius
+
+                if gap < min_gap:
+                    min_gap     = gap
+                    if centre_dist > 1e-9:
+                        closest_dir = (robot_pos - blob_pos) / centre_dist
 
         # ── Check boundary walls ──────────────────────────────────────────
-        # Find smallest gap to any wall
-        min_wall_gap = float('inf')
-        push_dir = np.zeros(2)  # direction to push away from wall
-
-        x, y = robot_pos[0], robot_pos[1]
-        r = self.robot_radius
-
-        # Left wall
-        gap_left = x - r - self.world_x_min
-        if gap_left < min_wall_gap:
-            min_wall_gap = gap_left
-            push_dir = np.array([1.0, 0.0])
-        # Right wall
-        gap_right = self.world_x_max - r - x
-        if gap_right < min_wall_gap:
-            min_wall_gap = gap_right
-            push_dir = np.array([-1.0, 0.0])
-        # Bottom wall
-        gap_bottom = y - r - self.world_y_min
-        if gap_bottom < min_wall_gap:
-            min_wall_gap = gap_bottom
-            push_dir = np.array([0.0, 1.0])
-        # Top wall
-        gap_top = self.world_y_max - r - y
-        if gap_top < min_wall_gap:
-            min_wall_gap = gap_top
-            push_dir = np.array([0.0, -1.0])
-
-        # Use whichever is worse (smaller gap)
-        min_gap = min(min_blob_gap, min_wall_gap)
-
-        # If only blob triggered, save its direction for Level 3
-        if min_blob_gap <= min_wall_gap and closest_blob_dir is not None:
-            closest_dir = closest_blob_dir
-        else:
-            closest_dir = push_dir
+        x, y = float(robot_pos[0]), float(robot_pos[1])
+        r    = self.robot_radius
+        wall_gaps = {
+            'left':   x   - r - self.world_x_min,
+            'right':  self.world_x_max - r - x,
+            'bottom': y   - r - self.world_y_min,
+            'top':    self.world_y_max - r - y,
+        }
+        wall_dirs = {
+            'left':   np.array([ 1.0,  0.0]),
+            'right':  np.array([-1.0,  0.0]),
+            'bottom': np.array([ 0.0,  1.0]),
+            'top':    np.array([ 0.0, -1.0]),
+        }
+        for wall, gap in wall_gaps.items():
+            if gap < min_gap:
+                min_gap     = gap
+                closest_dir = wall_dirs[wall]
 
         if min_gap == float('inf') or closest_dir is None:
-            return cmd  # no obstacles — passthrough
+            return cmd
 
-        # ── Level 3: Reverse ──────────────────────────────────────────────
+        # ── Level 3: OVERLAP — always reverse, no heading check ──────────
+        # OLD: required heading INTO obstacle → let robots sit inside blobs
+        # NEW: any overlap triggers reverse unconditionally
         if min_gap <= self.reverse_dist:
-            heading_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)])
-            into_obs = float(np.dot(heading_vec, -closest_dir))  # > 0 = toward obs
-            if into_obs > 0.1:
-                vl = -self.reverse_speed
-                vr = -self.reverse_speed
-                return WheelCommand(
-                    v=-self.reverse_speed,
-                    omega=cmd.omega * 0.5,
-                    vl=vl,
-                    vr=vr,
-                )
+            return WheelCommand(
+                v     = -self.reverse_speed,
+                omega = 0.0,                 # no steering while reversing — cleaner escape
+                vl    = -self.reverse_speed,
+                vr    = -self.reverse_speed,
+            )
 
         # ── Level 2: Hard brake ───────────────────────────────────────────
         if min_gap <= self.brake_dist:
-            return WheelCommand(
-                v=0.0,
-                omega=cmd.omega * 0.8,
-                vl=-cmd.omega * 0.4,
-                vr=cmd.omega * 0.4,
-            )
+            turn = float(np.cross(
+                np.array([math.cos(robot_yaw), math.sin(robot_yaw)]),
+                closest_dir
+            ))
+            omega_escape = float(np.clip(turn * 2.0,
+                                         -self.cfg_max_angular,
+                                          self.cfg_max_angular))
+            return WheelCommand(v=0.0, omega=omega_escape, vl=0.0, vr=0.0)
 
-        # ── Level 1: Slow down ────────────────────────────────────────────
+        # ── Level 1: Proportional slowdown ───────────────────────────────
         if min_gap <= self.warn_dist:
-            scale = max(
-                self.slow_factor,
-                (min_gap - self.brake_dist) / (self.warn_dist - self.brake_dist),
-            )
+            t     = (min_gap - self.brake_dist) / max(self.warn_dist - self.brake_dist, 1e-6)
+            scale = self.slow_factor + (1.0 - self.slow_factor) * float(np.clip(t, 0.0, 1.0))
             return WheelCommand(
-                v=cmd.v * scale,
-                omega=cmd.omega,
-                vl=cmd.vl * scale,
-                vr=cmd.vr * scale,
+                v     = cmd.v     * scale,
+                omega = cmd.omega,
+                vl    = cmd.vl   * scale,
+                vr    = cmd.vr   * scale,
             )
 
-        return cmd  # all clear
+        return cmd
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -928,17 +946,22 @@ class RobotController:
         self.blender = IntentionBlender(apf, max_pref_speed=cfg.max_linear_speed, robot_id=robot_id)
         self.orca = NHORCAPlanner(cfg)
         self.mapper = MotorMapper(cfg, filter_alpha=filter_alpha)
+        # EmergencyBrake zones scaled to COMBINED radius (robot + expected blob)
+        # so the brake fires early enough to prevent overlap.
+        EXPECTED_MAX_BLOB_R = 1.3   # largest blob radius in this scenario
+        combined_r = cfg.robot_radius + EXPECTED_MAX_BLOB_R  # 2.3m
         self.emergency = EmergencyBrake(
-            robot_radius=cfg.robot_radius,
-            warn_dist=cfg.robot_radius * 0.8, # 0.8m gap → slow down
-            brake_dist=cfg.robot_radius * 0.3, # 0.3m gap → hard brake
-            reverse_dist=0.0, # overlapping → reverse
-            slow_factor=0.35,
-            reverse_speed=cfg.max_linear_speed * 0.2,
-            world_x_min=cfg.world_x_min,
-            world_x_max=cfg.world_x_max,
-            world_y_min=cfg.world_y_min,
-            world_y_max=cfg.world_y_max,
+            robot_radius      = cfg.robot_radius,
+            warn_dist         = combined_r * 0.8,           # 1.84m gap → slow down (was 0.8m)
+            brake_dist        = combined_r * 0.4,           # 0.92m gap → hard brake (was 0.3m)
+            reverse_dist      = 0.1,                        # start reverse BEFORE overlap (was 0.0)
+            slow_factor       = 0.20,                       # more aggressive slowdown (was 0.35)
+            reverse_speed     = cfg.max_linear_speed * 0.4, # faster reverse (was 0.2)
+            world_x_min       = cfg.world_x_min,
+            world_x_max       = cfg.world_x_max,
+            world_y_min       = cfg.world_y_min,
+            world_y_max       = cfg.world_y_max,
+            max_angular_speed = cfg.max_angular_speed,
         )
 
         # State
@@ -1052,12 +1075,21 @@ class RobotController:
         )
 
 # ── Fleet yield: reduce V_pref BEFORE ORCA (critical ordering) ───
-    # By reducing V_pref here, ORCA sees the correct intended velocity.
-    # This means other robots' ORCA correctly predicts "A is slowing",
-    # preventing the velocity mismatch that caused ghost collisions.
-    # The _yield_ticks_left countdown handles auto-release.
-        if self.is_yielding and self._yield_scale < 1.0:
+    # CRITICAL FIX: Skip yield when APF is actively firing (blob nearby).
+    # The robot needs full escape velocity — yield scaling was cutting it
+    # by 40-60%, making it impossible to outrun a closing blob.
+    # Detect APF activity by checking if the APF component of V_pref is significant.
+        apf_component = np.linalg.norm(v_pref - v_path)
+        apf_is_firing = apf_component > 0.5  # APF pushing > 0.5 m/s = danger
+
+        if self.is_yielding and self._yield_scale < 1.0 and not apf_is_firing:
             v_pref = v_pref * self._yield_scale
+            self._yield_ticks_left -= 1
+            if self._yield_ticks_left <= 0:
+                self.is_yielding = False
+                self._yield_scale = 1.0
+        elif self.is_yielding and apf_is_firing:
+            # APF active — consume yield tick but DON'T scale velocity
             self._yield_ticks_left -= 1
             if self._yield_ticks_left <= 0:
                 self.is_yielding = False
@@ -1117,10 +1149,12 @@ class RobotController:
         # Runs AFTER the full pipeline. Catches what APF and ORCA missed.
         # This is the geometric hard-check that Gazebo physics requires.
         cmd = self.emergency.check(
-            cmd=cmd,
-            robot_pos=pos,
-            robot_yaw=yaw,
-            camera_blobs=camera_blobs,
+            cmd          = cmd,
+            robot_pos    = pos,
+            robot_yaw    = yaw,
+            camera_blobs = camera_blobs,
+            dt           = self.cfg.sim_dt,   # feed prediction parameters
+            lookahead    = 3,                  # predict 3 ticks ahead
         )
 
 # ── Fleet-level soft yield override ──────────────────────────────

@@ -36,11 +36,20 @@ def run_simulation(fleet, agent_data, camera_blobs=None, max_steps=3000, dt=0.1)
         blob_pos = circle_center + circle_radius * np.array([math.cos(angle), math.sin(angle)])
         blob_history.append((float(blob_pos[0]), float(blob_pos[1])))
 
+        # Angular velocity ω = 2π / (T_period × dt) rad/s
+        # Tangential velocity: d/dt [r·cos(ωt)] = -r·ω·sin(ωt)
+        #                      d/dt [r·sin(ωt)] = +r·ω·cos(ωt)
+        omega_blob = 2.0 * math.pi / (blob_period * dt)  # rad/s
+        blob_vx = -circle_radius * omega_blob * math.sin(angle)
+        blob_vy =  circle_radius * omega_blob * math.cos(angle)
+
         dynamic_camera_blobs = [CameraBlob(
             x=float(blob_pos[0]),
             y=float(blob_pos[1]),
             radius=1.3,
-            priority=1.5
+            priority=1.5,
+            vx=float(blob_vx),    # velocity for predictive EmergencyBrake
+            vy=float(blob_vy),    # velocity for predictive EmergencyBrake
         )]
 
         commands = fleet.tick_all(camera_blobs=dynamic_camera_blobs)
@@ -237,13 +246,13 @@ if __name__ == '__main__':
         robot_radius        = 1.0,
         wheel_base          = 0.8,
         max_linear_speed    = 2.0,
-        max_angular_speed   = 5.0,    # Reduced for more conservative turning
+        max_angular_speed   = 5.0,
         max_wheel_speed     = 3.0,
-        max_linear_accel    = 2.0,     # Reduced for smoother acceleration
-        max_linear_decel    = 3.0,     # Reduced for smoother deceleration
-        max_angular_accel   = 4.0,     # Reduced for smoother turns
-        tracking_error      = 0.50,    # Increased for more forgiving turns
-        orientation_time    = 1.2,     # More time for turns = smoother
+        max_linear_accel    = 2.0,
+        max_linear_decel    = 3.0,
+        max_angular_accel   = 4.0,
+        tracking_error      = 0.30,    # was 0.50 — reduces social_radius from 1.7 to 1.5, fewer premature yields
+        orientation_time    = 0.8,     # was 1.2 — faster rotation for escape maneuvers
         time_horizon        = 3.0,
         neighbor_dist       = 6.0,
         sim_dt              = 0.1,
@@ -267,18 +276,18 @@ if __name__ == '__main__':
 # Using ImprovedAPF with GNRO fix (Eq.1-3) + LocalMinimaState (Eq.4-6)
     p = ImprovedAPFParams(
         k_att=1.9,
-        eta=12.0,  # repulsion gain (η in paper)
-        rho_0=2.5,
-        max_force=12.0,
-        vortex_gain=0.3,
+        eta=18.0,          # was 12.0 — stronger repulsion for faster-moving blobs
+        rho_0=4.0,         # was 2.5 — earlier detection (surface gap 4m triggers APF)
+        max_force=18.0,    # was 12.0 — higher force ceiling before clamping
+        vortex_gain=0.4,   # was 0.3 — stronger tangential sliding around blobs
         robot_radius=cfg.robot_radius,
-        n_reg=0.5,  # regulation constant n (0 < n < 1)
-        step_length=0.2,  # normal step size l (Eq.4)
-        beta_stuck=3.0,  # stuck threshold β (Eq.4)
-        stuck_window=8,  # consecutive slow steps = stuck
-        beta1=2.0,  # virtual target x-amplitude β₁ (Eq.5)
-        beta2=2.0,  # virtual target y-amplitude β₂ (Eq.6)
-        n_vt=1.0,  # oscillation frequency (Eq.5-6)
+        n_reg=0.5,         # regulation constant n (0 < n < 1)
+        step_length=0.2,   # normal step size l (Eq.4)
+        beta_stuck=3.0,    # stuck threshold β (Eq.4)
+        stuck_window=8,    # consecutive slow steps = stuck
+        beta1=2.0,         # virtual target x-amplitude β₁ (Eq.5)
+        beta2=2.0,         # virtual target y-amplitude β₂ (Eq.6)
+        n_vt=1.0,          # oscillation frequency (Eq.5-6)
         virtual_target_duration=20,  # ticks to chase virtual target
     )
     apf = ImprovedAPF(
@@ -291,8 +300,8 @@ if __name__ == '__main__':
     # Two robots - Robot A will pass near camera blob at (6,6) before static circle at (8,8)
     agent_data = {
         'A': {'start': (2.0, 5.0, math.pi/4),'goal': (19.0, 18.0), 'color': 'royalblue'},
-        'B': {'start': (2.0, 15.0, 0.0),'goal': (15.0,  5.0), 'color': 'seagreen'},
-        'C': {'start': (2.0, 10.0, 0.0),'goal': (19.0,  14.0), 'color': 'yellow'},
+        'B': {'start': (2.0, 15.0, math.pi/2),'goal': (15.0,  5.0), 'color': 'seagreen'},
+        'C': {'start': (2.0, 10.0, 0.0),'goal': (19.0,  14.0), 'color': 'magenta'},
     }
 
     # ── 4. Build fleet ─────────────────────────────────────────────────────
@@ -302,9 +311,9 @@ if __name__ == '__main__':
     for rid, data in agent_data.items():
         robot = fleet.add_robot(
             rid,
-            filter_alpha     = 0.5, # for smoothing the velocity commands
-            goal_tolerance = 0.5, # A* last waypoint is ~1m from goal, need tolerance > path precision
-            lookahead_window = 20,   # wider scan — better for sparse A* paths
+            filter_alpha     = 1.0, # for smoothing the velocity commands
+            goal_tolerance = 1.0, # A* last waypoint is ~1m from goal, need tolerance > path precision
+            lookahead_window = 30,   # wider scan — better for sparse A* paths
             carrot_steps     = 10,    # further carrot — smoother following in large world
         )
         sx, sy, stheta = data['start']
