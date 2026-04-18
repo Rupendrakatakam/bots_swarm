@@ -10,8 +10,8 @@ import matplotlib.animation as animation
 from matplotlib.patches import Circle, Rectangle
 
 from hybrid_astar import HybridAStar
-from apf import ImprovedAPF, ImprovedAPFParams, CircleObstacle, RectObstacle, DynamicObstacle
-from apf_orca import (
+from apf import CircleObstacle, RectObstacle
+from only_orca import (
     FleetManager, DiffDriveConfig, CameraBlob,
     RobotController, WheelCommand
 )
@@ -46,8 +46,8 @@ def run_simulation(fleet, agent_data, camera_blobs=None, max_steps=3000, dt=0.1)
         dynamic_camera_blobs = [CameraBlob(
             x=float(blob_pos[0]),
             y=float(blob_pos[1]),
-            radius=1.3,
-            priority=1.5,
+            radius=2.0,
+            priority=2.0,
             vx=float(blob_vx),    # velocity for predictive EmergencyBrake
             vy=float(blob_vy),    # velocity for predictive EmergencyBrake
         )]
@@ -92,7 +92,7 @@ def build_figure(fleet, agent_data, global_paths, histories,
     ax.set_xlim(0, world_size)
     ax.set_ylim(0, world_size)
     ax.set_aspect('equal')
-    ax.set_title('Multi-Agent Navigation: APF + NH-ORCA Pipeline', fontsize=13)
+    ax.set_title('Multi-Agent Navigation: NH-ORCA Pipeline', fontsize=13)
     ax.set_xticks(np.arange(0, world_size + 1, 1))
     ax.set_yticks(np.arange(0, world_size + 1, 1))
     ax.grid(True, linestyle=':', alpha=0.5)
@@ -258,33 +258,12 @@ if __name__ == '__main__':
         max_angular_accel = 4.0,  # [rad/s²] Spin acceleration. 
         tracking_error    = 0.25, # [m] Swarm social bubble (ORCA). Decrease: robots pass closer. Increase: yields earlier.
         orientation_time  = 1.0,  # [s] Heading correction time. Decrease: faster response. Increase: smoother rotation.
-        time_horizon      = 3.0,  # [s] ORCA prediction. Increase: dodges swarm earlier, but path deflects more.
-        neighbor_dist     = 6.0,  # [m] Swarm sensing range. Increase: coordinates with distant robots.
+        time_horizon      = 7.0,  # [s] ORCA prediction. Increase: dodges swarm earlier, but path deflects more.
+        neighbor_dist     = 7.0,  # [m] Swarm sensing range. Increase: coordinates with distant robots.
         sim_dt            = 0.1,  # [s] 10Hz control loop.
     )
 
-    # --- B. Artificial Potential Field (APF) - Emergency Avoidance ---
-    # Controls how the robot dodges unknown camera blobs and static walls.
-    p = ImprovedAPFParams(
-        k_att        = 1.9,   # Pull to A* path. Increase: sticks tighter to path. Decrease: easily pushed off path.
-        eta          = 14.0,  # Repulsion strength. Increase: harder push away. Decrease: softer course corrections.
-        rho_0        = 3.0,   # [m] Repulsion zone. Increase: starts dodging earlier. Decrease: ignores obstacles until close.
-        max_force    = 12.0,  # Force ceiling. Increase: allows violent jerks to escape. Decrease: caps force for smoothness.
-        vortex_gain  = 0.15,  # Tangential sliding. Increase: slides perpendicularly around blobs. Decrease: less jitter.
-        robot_radius = cfg.robot_radius,
-        
-        # GNRO and Local Minima Escape (Eq. 4-6)
-        n_reg        = 0.5,   # GNRO regulation. Adjusts repulsion curve shape near goal.
-        step_length  = 0.2,   # Normal step size expected.
-        beta_stuck   = 3.0,   # Stuck detection threshold. Decrease: detects local minima faster.
-        stuck_window = 8,     # Ticks to declare stuck. Decrease: breaks out of local minima sooner.
-        beta1        = 2.0,   # Virtual target X amplitude. Increase: wider escape arcs.
-        beta2        = 2.0,   # Virtual target Y amplitude. Increase: wider escape arcs.
-        n_vt         = 1.0,   # Escape oscillation frequency.
-        virtual_target_duration = 20, # [ticks] Time to chase virtual target.
-    )
-
-    # --- C. Path Following & Smoothing ---
+    # --- B. Path Following & Smoothing ---
     FILTER_ALPHA     = 0.5  # Final velocity command EMA smoothing. Decrease: smoother commands but more lag.
     GOAL_TOLERANCE   = 0.5   # [m] Goal reach radius. Increase: finishes earlier if A* waypoints are sparse.
     LOOKAHEAD_WINDOW = 25    # A* waypoints to scan. Increase: recovers from large detours better.
@@ -293,8 +272,8 @@ if __name__ == '__main__':
     # =======================================================================
 
     # ── 2. Obstacles ───────────────────────────────────────────────────────
-    # Internal static obstacles for A* path planning AND APF emergency backup
-    INTERNAL_CIRCLES = [CircleObstacle(8.0, 8.0, 1.5)]  # Static pillar near diagonal path
+    # Internal static obstacles for A* path planning AND ORCA collision avoidance
+    INTERNAL_CIRCLES = [CircleObstacle(8.0, 8.0, 1.3)]  # Static pillar near diagonal path
     INTERNAL_RECTS   = []  # No rect obstacles as requested
 
     # Boundary walls for A*
@@ -306,13 +285,10 @@ if __name__ == '__main__':
     ]
     ALL_RECTS_FOR_ASTAR = INTERNAL_RECTS + BOUNDARY_RECTS
 
-    apf = ImprovedAPF(
-        p,
-        static_circles=INTERNAL_CIRCLES,
-        static_rects=INTERNAL_RECTS,
-    )
+    # ── 3. Build fleet with ORCA-only system ────────────────────────────────
+    static_circles = INTERNAL_CIRCLES
 
-    # ── 3. Agent definitions ────────────────────────────────────────────────
+    # ── 4. Agent definitions ────────────────────────────────────────────────
     # Two robots - Robot A will pass near camera blob at (6,6) before static circle at (8,8)
     agent_data = {
         'A': {'start': (2.0, 5.0, math.pi/4),'goal': (19.0, 18.0), 'color': 'royalblue'},
@@ -321,7 +297,7 @@ if __name__ == '__main__':
     }
 
     # ── 4. Build fleet ─────────────────────────────────────────────────────
-    fleet = FleetManager(cfg, apf)
+    fleet = FleetManager(cfg, static_circles=static_circles)
     global_paths = {}
 
     for rid, data in agent_data.items():
@@ -365,7 +341,7 @@ if __name__ == '__main__':
 
     # ── 5. Camera blobs ─────────────────────────────────────────────────────
     # Dynamic blob moves in circular motion around center (8,8) with radius 4
-    camera_blobs = [CameraBlob(x=12.0, y=8.0, radius=1.3, priority=1.5)]  # Starting at right side of circle
+    camera_blobs = [CameraBlob(x=12.0, y=8.0, radius=2.0, priority=1.5)]  # Starting at right side of circle
 
     # ── 6. Simulate ─────────────────────────────────────────────────────────
     print("Running simulation...")
